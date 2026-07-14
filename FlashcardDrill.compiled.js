@@ -1871,7 +1871,7 @@ export default function FlashcardDrillApp() {
         const readingNote = notes.find((n) => n.id === selectedNoteId);
         content = readingNote ? (React.createElement("div", { className: "flex flex-col gap-4" },
             React.createElement(BackHeader, { colors: COLORS, onBack: () => setView('notes'), title: selectedDeck.name }),
-            React.createElement("div", { className: "rounded-2xl border-2 px-5 py-6", style: { borderColor: COLORS.ink, backgroundColor: COLORS.card } },
+            React.createElement("div", { className: "rounded-2xl px-5 py-6", style: { backgroundColor: COLORS.card } },
                 React.createElement("h2", { style: { ...fontStyle, color: COLORS.ink }, className: "text-lg font-bold mb-3" }, readingNote.title),
                 React.createElement(NoteBody, { text: readingNote.body })),
             React.createElement("p", { style: { ...monoStyle, color: COLORS.inkFaint }, className: "text-xs text-center" }, "How was this read?"),
@@ -2523,7 +2523,16 @@ export default function FlashcardDrillApp() {
         .note-markdown pre code { background: none; padding: 0; }
         .note-markdown a { color: ${COLORS.accent}; text-decoration: underline; }
         .note-markdown hr { border: none; border-top: 1px solid ${COLORS.rule}; margin: 1em 0; }
-        .note-markdown table { border-collapse: collapse; margin: 0.7em 0; font-size: 0.9em; }
+        .note-markdown table {
+          display: block;
+          max-width: 100%;
+          overflow-x: auto;
+          -webkit-overflow-scrolling: touch;
+          border-collapse: collapse;
+          margin: 0.7em 0;
+          font-size: 0.9em;
+          white-space: nowrap;
+        }
         .note-markdown th, .note-markdown td { border: 1px solid ${COLORS.rule}; padding: 0.35em 0.6em; }
         .note-markdown .katex-inline, .note-markdown .katex { color: ${COLORS.ink}; }
       `),
