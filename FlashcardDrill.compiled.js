@@ -2105,19 +2105,19 @@ export default function FlashcardDrillApp() {
                 React.createElement("span", { style: { ...monoStyle, color: COLORS.inkFaint }, className: "text-[10px] tracking-widest uppercase mt-1" }, "due today"))) : (React.createElement(React.Fragment, null,
                 React.createElement(Check, { size: 26, style: { color: COLORS.green } }),
                 React.createElement("span", { style: { ...monoStyle, color: COLORS.inkFaint }, className: "text-[10px] tracking-widest uppercase mt-1" }, "caught up"))))));
-        const statChipsEl = (React.createElement("div", { className: "flex gap-2" },
-            React.createElement("div", { className: "flex items-center gap-1.5 rounded-full px-3 py-1.5", style: { backgroundColor: COLORS.neutralBg } },
+        const statChipsEl = (React.createElement("div", { className: "flex flex-wrap gap-2" },
+            React.createElement("div", { className: "flex items-center gap-1.5 rounded-full px-3 py-1.5 shrink-0 whitespace-nowrap", style: { backgroundColor: COLORS.neutralBg } },
                 React.createElement(Layers, { size: 12, style: { color: COLORS.ink } }),
                 React.createElement("span", { style: { ...monoStyle, color: COLORS.ink }, className: "text-xs font-bold" }, decks.length),
                 React.createElement("span", { style: { ...monoStyle, color: COLORS.inkFaint }, className: "text-xs" }, decks.length === 1 ? 'deck' : 'decks')),
-            totalNotesDue > 0 && (React.createElement("div", { className: "flex items-center gap-1.5 rounded-full px-3 py-1.5", style: { backgroundColor: COLORS.notesAccentBg } },
+            totalNotesDue > 0 && (React.createElement("div", { className: "flex items-center gap-1.5 rounded-full px-3 py-1.5 shrink-0 whitespace-nowrap", style: { backgroundColor: COLORS.notesAccentBg } },
                 React.createElement(BookOpen, { size: 12, style: { color: COLORS.notesAccent } }),
                 React.createElement("span", { style: { ...monoStyle, color: COLORS.notesAccent }, className: "text-xs font-bold" }, totalNotesDue),
                 React.createElement("span", { style: { ...monoStyle, color: COLORS.notesAccent }, className: "text-xs" }, "notes due")))));
         const heroEl = (React.createElement("div", { className: "flex flex-col gap-4 lg:flex-row lg:items-center lg:gap-8" },
             React.createElement("div", { className: "flex items-center gap-4 lg:gap-6" },
                 ringEl,
-                React.createElement("div", { className: "flex flex-col gap-2" },
+                React.createElement("div", { className: "flex flex-col gap-2 min-w-0" },
                     React.createElement("div", null,
                         React.createElement("h1", { style: { ...fontStyle, color: COLORS.ink }, className: "text-xl lg:text-3xl font-bold" }, greeting),
                         React.createElement("p", { style: { ...monoStyle, color: COLORS.inkFaint }, className: "text-xs lg:text-sm mt-0.5" }, decks.length === 0 ? 'Create your first deck to get started' : totalDue > 0 ? `${totalDue} card${totalDue !== 1 ? 's' : ''} ready across ${decks.length} deck${decks.length !== 1 ? 's' : ''}` : 'Everything reviewed \u2014 nice work')),
@@ -2192,10 +2192,7 @@ export default function FlashcardDrillApp() {
             actionRowEl,
             decks.length > 0 && (React.createElement("div", { className: "flex flex-col gap-2" }, searchEl, chipsEl)),
             deckListEl,
-            driveEl,
-            React.createElement("button", { onClick: () => setView('settings'), style: { color: COLORS.inkFaint, ...fontStyle }, className: "w-full py-2 font-medium flex items-center justify-center gap-2 mt-2 transition-transform active:scale-[0.98]" },
-                React.createElement(SettingsIcon, { size: 16 }),
-                " Settings")));
+            driveEl));
         // =====================================================================
         // SECTION: NEW DECK SCREEN  (search: SECTION: NEW DECK SCREEN)
         // Deck name + category input fields, Create button.
@@ -2731,9 +2728,13 @@ export default function FlashcardDrillApp() {
         // =====================================================================
         // SECTION: SETTINGS SCREEN  (search: SECTION: SETTINGS SCREEN)
         // Cards-per-cycle, Font Size, Backup & Restore nav, Edit Zone nav, Dark
-        // Mode toggle, Danger Zone — in that top-to-bottom order below. To
-        // reorder sections, move their <div> blocks. (Practice Order used to
-        // live here — it's now per-deck; see updateDeckPracticeOrder.)
+        // Mode toggle, Danger Zone, Log Out — in that top-to-bottom order below.
+        // Log Out reuses handleGoogleSignOut (see FUNCTIONS: GOOGLE DRIVE
+        // CONNECTION) — disabled when !googleSignedIn since there's nothing to
+        // sign out of; same action as Backup & Restore's "Sign out" link, just
+        // surfaced here too for direct access. To reorder sections, move their
+        // <div> blocks. (Practice Order used to live here — it's now per-deck;
+        // see updateDeckPracticeOrder.)
         // =====================================================================
     }
     else if (view === 'settings') {
@@ -2796,7 +2797,10 @@ export default function FlashcardDrillApp() {
                     React.createElement("p", { style: { ...fontStyle, color: COLORS.ink }, className: "text-sm" }, "This deletes every deck and card permanently."),
                     React.createElement("div", { className: "flex gap-2" },
                         React.createElement("button", { onClick: resetEverything, style: { backgroundColor: COLORS.red, ...fontStyle }, className: "flex-1 rounded-lg text-white text-sm font-bold py-2" }, "Yes, Delete Everything"),
-                        React.createElement("button", { onClick: () => setConfirmReset(false), style: { borderColor: COLORS.ink, color: COLORS.ink, ...fontStyle }, className: "flex-1 rounded-lg border-2 text-sm font-bold py-2" }, "Cancel")))))));
+                        React.createElement("button", { onClick: () => setConfirmReset(false), style: { borderColor: COLORS.ink, color: COLORS.ink, ...fontStyle }, className: "flex-1 rounded-lg border-2 text-sm font-bold py-2" }, "Cancel"))))),
+            React.createElement("button", { onClick: handleGoogleSignOut, disabled: !googleSignedIn, style: { borderColor: COLORS.red, color: COLORS.red, ...fontStyle }, className: "w-full rounded-xl border-2 py-3 font-bold flex items-center justify-center gap-2 text-sm disabled:opacity-40 transition-transform active:scale-[0.98]" },
+                React.createElement(LogOut, { size: 16 }),
+                " Log Out")));
         // =====================================================================
         // SECTION: BACKUP & RESTORE SCREEN  (search: SECTION: BACKUP SCREEN)
         // Local backup/restore buttons, Google Drive status + backup/restore/
@@ -3267,11 +3271,14 @@ export default function FlashcardDrillApp() {
     const fallbackEl = (React.createElement("div", { className: "flex flex-col gap-3" },
         React.createElement("p", { style: { ...fontStyle, color: COLORS.inkFaint }, className: "text-sm" }, "That screen isn't available anymore."),
         React.createElement("button", { onClick: () => setView('home'), style: { backgroundColor: COLORS.accent, ...fontStyle }, className: "w-full rounded-xl py-3 text-white font-bold" }, "Back to Home")));
-    // mobileHeaderEl: title + round number, shown below lg only (sidebar carries
+    // mobileHeaderEl: title + right-side slot, shown below lg only (sidebar carries
     // branding at lg+; round number surfaces in the sidebar's session badge there).
+    // Right slot is the Settings gear on Home (top-right corner, replaces the old
+    // bottom-of-Home Settings button) or the round-number badge during practice —
+    // the two conditions are mutually exclusive so they share the one slot.
     const mobileHeaderEl = (React.createElement("div", { className: "flex items-center justify-between mb-5 lg:hidden" },
         React.createElement("span", { onClick: goHome, style: { fontFamily: "'Roboto Slab', serif", color: COLORS.ink, cursor: 'pointer' }, className: "text-lg font-bold tracking-tight" }, "Flashcard Drill"),
-        React.createElement("span", { style: { fontFamily: "'Space Mono', monospace", color: COLORS.inkFaint }, className: "text-xs" }, roundNumber > 1 && view === 'practice' ? `rd.${roundNumber}` : '')));
+        isHomeView ? (React.createElement("button", { onClick: () => setView('settings'), "aria-label": "Settings", style: { color: COLORS.inkFaint }, className: "p-2 -mr-2 rounded-lg transition-transform active:scale-90" }, React.createElement(SettingsIcon, { size: 20 }))) : (React.createElement("span", { style: { fontFamily: "'Space Mono', monospace", color: COLORS.inkFaint }, className: "text-xs" }, roundNumber > 1 && view === 'practice' ? `rd.${roundNumber}` : ''))));
     // canvasEl: the panel to the right of sidebarEl at lg+ (full-bleed below lg,
     // where it's just the familiar single centered card).
     const canvasEl = (React.createElement("div", { style: { backgroundColor: COLORS.paper, borderColor: COLORS.rule }, className: "w-full max-w-sm md:max-w-lg lg:max-w-none min-h-screen md:min-h-0 md:rounded-2xl md:border-2 md:shadow-2xl lg:rounded-none lg:border-0 lg:shadow-none lg:flex-1 lg:flex lg:justify-center lg:overflow-y-auto lg:px-12 lg:py-12" },
