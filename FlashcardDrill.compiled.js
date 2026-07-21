@@ -101,7 +101,11 @@ const BACKUP_META_KEY = 'flashdrill:v2:backupMeta';
 // hosted on a real domain (e.g. GitHub Pages) that's registered as an authorized
 // JavaScript origin for this client ID. See the setup notes in the Backup screen.
 const GOOGLE_CLIENT_ID = '790736366293-a7dlgr671caebbam0gu5kkkot8tbmcn0.apps.googleusercontent.com';
-const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.appdata';
+// Needs BOTH scopes: drive.appdata to read/write the hidden backup file, and
+// userinfo.email so the /oauth2/v3/userinfo call after sign-in can return an
+// email at all (without it, that call fails with insufficient scope, and the
+// email used to silently re-sign-in on future visits never gets saved).
+const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.appdata https://www.googleapis.com/auth/userinfo.email';
 const DRIVE_BACKUP_FILENAME = 'flashdrill-backup.json';
 const BACKUP_VERSION = 2;
 const SAMPLE_TEXT = `$Who is known as the chief architect of the Indian Constitution?
@@ -574,6 +578,7 @@ export default function FlashcardDrillApp() {
     const [googleSignedIn, setGoogleSignedIn] = useState(false);
     const [googleEmail, setGoogleEmail] = useState(null);
     const [driveSignedOutByUser, setDriveSignedOutByUser] = useState(false);
+    const [driveHasSignedInBefore, setDriveHasSignedInBefore] = useState(false);
     const [driveAccessToken, setDriveAccessToken] = useState(null);
     const [driveBusy, setDriveBusy] = useState(false);
     const [driveNotice, setDriveNotice] = useState(null); // { tone: 'error'|'success'|'info', text }
@@ -724,6 +729,8 @@ export default function FlashcardDrillApp() {
                         setGoogleEmail(m.googleEmail);
                     if (typeof m.driveSignedOutByUser === 'boolean')
                         setDriveSignedOutByUser(m.driveSignedOutByUser);
+                    if (m.driveHasSignedInBefore || m.googleEmail)
+                        setDriveHasSignedInBefore(true);
                 }
             }
             catch (e) { }
@@ -784,6 +791,7 @@ export default function FlashcardDrillApp() {
             lastDriveBackupAt,
             googleEmail,
             driveSignedOutByUser,
+            driveHasSignedInBefore,
             ...patch,
         };
         if ('lastLocalBackupAt' in patch)
@@ -794,6 +802,8 @@ export default function FlashcardDrillApp() {
             setGoogleEmail(patch.googleEmail);
         if ('driveSignedOutByUser' in patch)
             setDriveSignedOutByUser(patch.driveSignedOutByUser);
+        if ('driveHasSignedInBefore' in patch)
+            setDriveHasSignedInBefore(patch.driveHasSignedInBefore);
         try {
             await window.storage.set(BACKUP_META_KEY, JSON.stringify(next), false);
         }
@@ -925,7 +935,7 @@ export default function FlashcardDrillApp() {
             const token = await requestDriveToken();
             setDriveAccessToken(token);
             setGoogleSignedIn(true);
-            persistBackupMeta({ driveSignedOutByUser: false });
+            persistBackupMeta({ driveSignedOutByUser: false, driveHasSignedInBefore: true });
             try {
                 const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
                     headers: { Authorization: `Bearer ${token}` },
@@ -976,10 +986,10 @@ export default function FlashcardDrillApp() {
     // last Google session with no popup. Fails silently (no error shown) if
     // there's nothing to reuse — that's expected, not a bug.
     async function attemptSilentSignIn() {
-        if (!driveConfigured() || !googleEmail || driveSignedOutByUser)
+        if (!driveConfigured() || !driveHasSignedInBefore || driveSignedOutByUser)
             return;
         try {
-            const token = await requestDriveToken({ silent: true, hint: googleEmail });
+            const token = await requestDriveToken({ silent: true, hint: googleEmail || undefined });
             setDriveAccessToken(token);
             setGoogleSignedIn(true);
         }
