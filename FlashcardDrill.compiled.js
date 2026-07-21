@@ -3252,7 +3252,7 @@ export default function FlashcardDrillApp() {
         .note-markdown .note-table-wrap.fd-dragging { cursor: grabbing; user-select: none; -webkit-user-select: none; }
         .note-markdown th, .note-markdown td {
           border: 1px solid ${COLORS.rule}; padding: 0.35em 0.6em;
-          min-width: 60px; max-width: 350px; white-space: normal;
+          min-width: 60px; max-width: 300px; white-space: normal;
           text-align: left;
           /* Deliberately NO word-break/overflow-wrap: those make the browser treat a
              column's minimum width as a single character, which defeats the auto
