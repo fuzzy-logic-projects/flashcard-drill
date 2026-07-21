@@ -1005,11 +1005,8 @@ export default function FlashcardDrillApp() {
         if (!silent)
             setDriveNotice(null);
         setDriveBusy(true);
-        try {
-            let token = driveAccessToken;
-            if (!token)
-                token = await requestDriveToken();
-            const payload = buildBackupPayload(overrideDecks || decks, overrideCards || cards, overrideNotes || notes, { cycleSize });
+        const payload = buildBackupPayload(overrideDecks || decks, overrideCards || cards, overrideNotes || notes, { cycleSize });
+        const attemptUpload = async (token) => {
             const existingId = await driveFindBackupFileId(token);
             const metadata = { name: DRIVE_BACKUP_FILENAME, mimeType: 'application/json', parents: existingId ? undefined : ['appDataFolder'] };
             const boundary = 'flashdrill_boundary';
@@ -1025,6 +1022,20 @@ export default function FlashcardDrillApp() {
             });
             if (!res.ok)
                 throw new Error('drive-upload-failed');
+        };
+        try {
+            let token = driveAccessToken;
+            if (!token)
+                token = await requestDriveToken();
+            try {
+                await attemptUpload(token);
+            }
+            catch (e) {
+                // Token may have expired mid-session (~1hr lifetime) — refresh
+                // silently once and retry before giving up.
+                token = await requestDriveToken({ silent: true, hint: googleEmail });
+                await attemptUpload(token);
+            }
             setDriveAccessToken(token);
             setGoogleSignedIn(true);
             persistBackupMeta({ lastDriveBackupAt: new Date().toISOString() });
@@ -1197,6 +1208,20 @@ export default function FlashcardDrillApp() {
         attemptSilentSignIn();
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [loaded]);
+    // Google's Drive access token expires after ~1hr. If the tab is left open
+    // longer than that, nothing else renews it — so proactively re-run the
+    // same silent, no-popup sign-in every 45 minutes while signed in, well
+    // before the token actually expires.
+    // ===== FUNCTION: BACKGROUND TOKEN REFRESH (search: FUNCTION: BACKGROUND TOKEN REFRESH) =====
+    useEffect(() => {
+        if (!googleSignedIn)
+            return;
+        const id = setInterval(() => {
+            attemptSilentSignIn();
+        }, 45 * 60 * 1000);
+        return () => clearInterval(id);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [googleSignedIn]);
     // Tailwind's text-xs/sm/base/etc classes are all rem-based, relative to the root
     // <html> font-size — so changing that one value scales every piece of text in
     // the app proportionally, without needing to touch each component individually.

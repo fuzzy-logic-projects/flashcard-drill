@@ -20,6 +20,60 @@
 </head>
 <body>
 <div id="root"></div>
+<script>
+  // window.storage shim — the app calls window.storage.get/set(key, false)
+  // to persist decks, cards, notes, settings, and the Google sign-in hint.
+  // That API is built into Claude.ai's artifact preview but does NOT exist
+  // on a plain static host, so every read/write was silently failing and
+  // nothing survived closing the tab. This backs it with localStorage so it
+  // actually persists (per browser/device). Must run before the module
+  // script below, since it's a synchronous classic script.
+  (function () {
+    var PREFIX = 'flashdrill_storage:';
+    function fullKey(key, shared) { return PREFIX + (shared ? 'shared:' : 'priv:') + key; }
+    window.storage = {
+      get: function (key, shared) {
+        return new Promise(function (resolve, reject) {
+          try {
+            var raw = localStorage.getItem(fullKey(key, shared));
+            if (raw === null) { reject(new Error('key not found')); return; }
+            resolve({ key: key, value: raw, shared: !!shared });
+          } catch (e) { reject(e); }
+        });
+      },
+      set: function (key, value, shared) {
+        return new Promise(function (resolve, reject) {
+          try {
+            localStorage.setItem(fullKey(key, shared), value);
+            resolve({ key: key, value: value, shared: !!shared });
+          } catch (e) { reject(e); }
+        });
+      },
+      delete: function (key, shared) {
+        return new Promise(function (resolve, reject) {
+          try {
+            localStorage.removeItem(fullKey(key, shared));
+            resolve({ key: key, deleted: true, shared: !!shared });
+          } catch (e) { reject(e); }
+        });
+      },
+      list: function (prefix, shared) {
+        return new Promise(function (resolve, reject) {
+          try {
+            var base = PREFIX + (shared ? 'shared:' : 'priv:');
+            var match = base + (prefix || '');
+            var keys = [];
+            for (var i = 0; i < localStorage.length; i++) {
+              var lk = localStorage.key(i);
+              if (lk && lk.indexOf(match) === 0) keys.push(lk.slice(base.length));
+            }
+            resolve({ keys: keys, prefix: prefix, shared: !!shared });
+          } catch (e) { reject(e); }
+        });
+      }
+    };
+  })();
+</script>
 <script type="module">
   import React from 'react';
   import { createRoot } from 'react-dom/client';
