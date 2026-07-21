@@ -1309,6 +1309,26 @@ export default function FlashcardDrillApp() {
         return () => clearInterval(id);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [googleSignedIn]);
+    // The cached token's ~1hr clock runs regardless of connectivity, so any offline
+    // stretch past that point leaves it expired the moment we're back online — and
+    // if the 45-min interval above happened to tick while still offline, that retry
+    // was wasted too. Without this, recovery waits for the next interval tick (up to
+    // 45 more min) or a manual reload. 'online' fires as soon as the OS reports
+    // connectivity back, so retry immediately: reuse the cache if it's still valid,
+    // otherwise fall back to the same no-popup silent reauth.
+    // ===== FUNCTION: ONLINE RECONNECT SIGN-IN (search: FUNCTION: ONLINE RECONNECT SIGN-IN) =====
+    useEffect(() => {
+        function onOnline() {
+            (async () => {
+                const reused = await tryReuseCachedDriveToken();
+                if (!reused)
+                    attemptSilentSignIn();
+            })();
+        }
+        window.addEventListener('online', onOnline);
+        return () => window.removeEventListener('online', onOnline);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [googleEmail, driveSignedOutByUser]);
     // Tailwind's text-xs/sm/base/etc classes are all rem-based, relative to the root
     // <html> font-size — so changing that one value scales every piece of text in
     // the app proportionally, without needing to touch each component individually.
