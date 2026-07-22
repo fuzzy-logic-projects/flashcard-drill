@@ -884,6 +884,14 @@ export default function FlashcardDrillApp() {
             tokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
                 client_id: GOOGLE_CLIENT_ID,
                 scope: DRIVE_SCOPE,
+                // Confirmed 2026-07-22: prompt:'none' was hanging forever with no
+                // callback at all. That's the classic symptom of the legacy silent
+                // check (a hidden iframe reading a 3rd-party accounts.google.com
+                // cookie) under Chrome's now-default third-party-cookie blocking —
+                // it doesn't fail cleanly, it just never responds. FedCM is Google's
+                // browser-mediated replacement for that same session check, so it
+                // isn't blocked by 3P-cookie restrictions the same way.
+                use_fedcm_for_prompt: true,
                 callback: () => { }, // overridden per-call below
             });
         }
