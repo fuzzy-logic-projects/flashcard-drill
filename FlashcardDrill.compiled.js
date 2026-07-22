@@ -911,7 +911,9 @@ export default function FlashcardDrillApp() {
             }
             try {
                 const client = await ensureTokenClient();
+                console.warn('[FlashDrill] GIS script + token client ready');
                 client.callback = (resp) => {
+                    console.warn('[FlashDrill] requestAccessToken callback fired:', resp && (resp.access_token ? 'got token' : resp.error || 'no-token'));
                     if (resp && resp.access_token) {
                         const expiresInSec = Number(resp.expires_in) || 3600;
                         persistDriveTokenCache(resp.access_token, Date.now() + expiresInSec * 1000);
@@ -928,9 +930,11 @@ export default function FlashcardDrillApp() {
                 const overrideConfig = { prompt: opts.silent ? 'none' : googleEmail ? '' : 'consent' };
                 if (opts.hint)
                     overrideConfig.login_hint = opts.hint;
+                console.warn('[FlashDrill] calling requestAccessToken with', overrideConfig);
                 client.requestAccessToken(overrideConfig);
             }
             catch (e) {
+                console.warn('[FlashDrill] ensureTokenClient/script load failed:', e && e.message);
                 reject(e);
             }
         });
@@ -1121,7 +1125,7 @@ export default function FlashcardDrillApp() {
             // silently forever.
             const token = await Promise.race([
                 requestDriveToken({ silent: true, hint: googleEmail }),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('silent-timeout: Google never called back within 6s')), 6000)),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('silent-timeout: Google never called back within 10s')), 10000)),
             ]);
             setDriveAccessToken(token);
             setGoogleSignedIn(true);
