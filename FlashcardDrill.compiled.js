@@ -1043,16 +1043,22 @@ export default function FlashcardDrillApp() {
     async function tryReuseCachedDriveToken() {
         try {
             const res = await window.storage.get(DRIVE_TOKEN_CACHE_KEY, false);
-            if (!res || !res.value)
+            if (!res || !res.value) {
+                console.warn('[FlashDrill] cached token: none stored');
                 return false;
+            }
             const cached = JSON.parse(res.value);
             if (cached && cached.token && cached.expiresAt && cached.expiresAt - 120000 > Date.now()) {
+                console.warn('[FlashDrill] cached token: valid, reusing');
                 setDriveAccessToken(cached.token);
                 setGoogleSignedIn(true);
                 return true;
             }
+            console.warn('[FlashDrill] cached token: present but expired', { expiresAt: cached && cached.expiresAt, now: Date.now() });
         }
-        catch (e) { }
+        catch (e) {
+            console.warn('[FlashDrill] cached token: read failed', e && e.message);
+        }
         return false;
     }
     // Quietly re-authenticates using the last-used account, with no popup, so the
@@ -1070,8 +1076,16 @@ export default function FlashcardDrillApp() {
     // brief "One moment please" screen on some mobile browsers — expected to be
     // rare now since it only runs when there's no valid cached token left.
     async function attemptSilentSignIn() {
-        if (!driveConfigured() || !googleEmail || driveSignedOutByUser)
+        if (!driveConfigured() || !googleEmail || driveSignedOutByUser) {
+            // TEMP DEBUG: this early return produces NO console output and NO
+            // caption by design elsewhere — which is exactly what was observed
+            // (silent failure, nothing in console). Logging the actual values so
+            // we can see which condition is bailing instead of guessing.
+            const why = { configured: !!driveConfigured(), googleEmail, driveSignedOutByUser };
+            console.warn('[FlashDrill] silent sign-in SKIPPED (guard) —', why);
+            setDriveSilentDebug(`skipped: configured=${why.configured} email=${why.googleEmail} signedOutByUser=${why.driveSignedOutByUser} @ ${new Date().toLocaleTimeString()}`);
             return;
+        }
         try {
             const token = await requestDriveToken({ silent: true, hint: googleEmail });
             setDriveAccessToken(token);
