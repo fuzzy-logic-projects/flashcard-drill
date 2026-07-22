@@ -1106,7 +1106,15 @@ export default function FlashcardDrillApp() {
             return;
         }
         try {
-            const token = await requestDriveToken({ silent: true, hint: googleEmail });
+            // TEMP DEBUG: no guard-skip log and no catch log after cache-expired
+            // (2026-07-22) means the call below is neither resolving nor rejecting —
+            // Google's prompt:'none' callback simply never firing, a known GIS quirk.
+            // Race against a timeout so that failure mode surfaces instead of hanging
+            // silently forever.
+            const token = await Promise.race([
+                requestDriveToken({ silent: true, hint: googleEmail }),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('silent-timeout: Google never called back within 6s')), 6000)),
+            ]);
             setDriveAccessToken(token);
             setGoogleSignedIn(true);
             setDriveSilentDebug(null);
