@@ -578,6 +578,12 @@ export default function FlashcardDrillApp() {
     const [driveAccessToken, setDriveAccessToken] = useState(null);
     const [driveBusy, setDriveBusy] = useState(false);
     const [driveNotice, setDriveNotice] = useState(null); // { tone: 'error'|'success'|'info', text }
+    // TEMP DEBUG (added 2026-07-22, remove once silent sign-in is root-caused):
+    // attemptSilentSignIn's real failure reason was being swallowed by an empty
+    // catch, so there was no way to see why it kept failing past the ~1hr cache
+    // window. This surfaces the raw error on-screen next to the sign-in button —
+    // screenshot it and it tells us exactly what Google returned.
+    const [driveSilentDebug, setDriveSilentDebug] = useState(null);
     const [pendingRestore, setPendingRestore] = useState(null); // { source: 'file'|'drive', payload }
     const [signInSyncPrompt, setSignInSyncPrompt] = useState(null); // { drivePayload } — shown only when local decks already exist at sign-in
     const tokenClientRef = useRef(null);
@@ -948,6 +954,7 @@ export default function FlashcardDrillApp() {
             const token = await requestDriveToken();
             setDriveAccessToken(token);
             setGoogleSignedIn(true);
+            setDriveSilentDebug(null);
             persistBackupMeta({ driveSignedOutByUser: false });
             try {
                 const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
@@ -1021,6 +1028,7 @@ export default function FlashcardDrillApp() {
         setLastLocalBackupAt(null);
         setLastDriveBackupAt(null);
         setDriveNotice(null);
+        setDriveSilentDebug(null);
         setSelectedDeckId(null);
         setView('home');
     }
@@ -1068,10 +1076,16 @@ export default function FlashcardDrillApp() {
             const token = await requestDriveToken({ silent: true, hint: googleEmail });
             setDriveAccessToken(token);
             setGoogleSignedIn(true);
+            setDriveSilentDebug(null);
         }
         catch (e) {
             // Expected whenever there's no active Google session in this browser —
-            // just leave the "Continue with Google" button showing.
+            // just leave the "Continue with Google" button showing. TEMP: also
+            // capture what Google actually said, so we can see it on-screen instead
+            // of guessing (see driveSilentDebug above).
+            const msg = (e && e.message) || String(e) || 'unknown error';
+            console.warn('[FlashDrill] silent sign-in failed:', msg);
+            setDriveSilentDebug(`${msg} @ ${new Date().toLocaleTimeString()}`);
         }
     }
     async function driveFindBackupFileId(token) {
@@ -3291,7 +3305,7 @@ export default function FlashcardDrillApp() {
         React.createElement("div", { className: "flex items-center justify-between rounded-lg px-3 py-2 border-2", style: { borderColor: COLORS.rule } },
             React.createElement("span", { style: { ...fontStyle, color: COLORS.ink }, className: "text-xs font-bold flex items-center gap-2" }, darkMode ? React.createElement(Moon, { size: 14 }) : React.createElement(Sun, { size: 14 }), darkMode ? "Dark Mode" : "Light Mode"),
             React.createElement("button", { onClick: () => persistDarkMode(!darkMode), style: { backgroundColor: darkMode ? COLORS.ink : COLORS.rule }, className: "w-11 h-6 rounded-full relative transition-colors shrink-0" }, React.createElement("span", { className: "absolute top-0.5 w-5 h-5 rounded-full bg-white transition-all", style: { left: darkMode ? '20px' : '2px' } }))),
-        !googleSignedIn ? (React.createElement("button", { onClick: handleGoogleSignIn, disabled: driveBusy, style: { borderColor: COLORS.ink, color: COLORS.ink, ...fontStyle }, className: "w-full rounded-lg border-2 text-xs font-bold py-2 flex items-center justify-center gap-2 disabled:opacity-50" }, React.createElement(Cloud, { size: 13 }), driveBusy ? 'Connecting…' : 'Continue with Google')) : (React.createElement("div", { className: "w-full rounded-lg border-2 text-xs py-2 flex items-center justify-center gap-1", style: { borderColor: COLORS.rule, color: COLORS.green, ...monoStyle } }, React.createElement(Check, { size: 12 }), googleEmail || 'Signed in'))));
+        !googleSignedIn ? (React.createElement("button", { onClick: handleGoogleSignIn, disabled: driveBusy, style: { borderColor: COLORS.ink, color: COLORS.ink, ...fontStyle }, className: "w-full rounded-lg border-2 text-xs font-bold py-2 flex items-center justify-center gap-2 disabled:opacity-50" }, React.createElement(Cloud, { size: 13 }), driveBusy ? 'Connecting…' : 'Continue with Google')) : (React.createElement("div", { className: "w-full rounded-lg border-2 text-xs py-2 flex items-center justify-center gap-1", style: { borderColor: COLORS.rule, color: COLORS.green, ...monoStyle } }, React.createElement(Check, { size: 12 }), googleEmail || 'Signed in')), (!googleSignedIn && driveSilentDebug ? React.createElement("p", { style: { ...monoStyle, color: COLORS.inkFaint }, className: "text-[10px] text-center break-words" }, `silent sign-in: ${driveSilentDebug}`) : null)));
     // fallbackEl: shown if `content` never got assigned above (unknown/stale `view`).
     const fallbackEl = (React.createElement("div", { className: "flex flex-col gap-3" },
         React.createElement("p", { style: { ...fontStyle, color: COLORS.inkFaint }, className: "text-sm" }, "That screen isn't available anymore."),
