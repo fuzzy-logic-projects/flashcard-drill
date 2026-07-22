@@ -906,7 +906,12 @@ export default function FlashcardDrillApp() {
                     else
                         reject(new Error((resp && resp.error) || 'no-token'));
                 };
-                const overrideConfig = { prompt: opts.silent ? 'none' : googleSignedIn ? '' : 'consent' };
+                // Gate on googleEmail (persisted proof this account already granted
+                // consent before), not googleSignedIn (just in-memory, false after any
+                // failed/skipped silent attempt) — otherwise every manual fallback tap
+                // post-silent-failure forces Google's full consent screen again instead
+                // of the lighter account-chooser-only flow it's entitled to.
+                const overrideConfig = { prompt: opts.silent ? 'none' : googleEmail ? '' : 'consent' };
                 if (opts.hint)
                     overrideConfig.login_hint = opts.hint;
                 client.requestAccessToken(overrideConfig);
