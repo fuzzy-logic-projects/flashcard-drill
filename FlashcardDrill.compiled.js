@@ -956,17 +956,7 @@ export default function FlashcardDrillApp() {
             setGoogleSignedIn(true);
             setDriveSilentDebug(null);
             persistBackupMeta({ driveSignedOutByUser: false });
-            try {
-                const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-                    headers: { Authorization: `Bearer ${token}` },
-                });
-                if (res.ok) {
-                    const info = await res.json();
-                    if (info.email)
-                        persistBackupMeta({ googleEmail: info.email });
-                }
-            }
-            catch (e) { }
+            await captureGoogleEmailIfMissing(token);
             await syncAfterSignIn(token);
             setDriveNotice((prev) => prev || { tone: 'success', text: 'Signed in.' });
         }
@@ -1040,6 +1030,30 @@ export default function FlashcardDrillApp() {
     // reauth (prompt:'none') still briefly opens a real window on mobile browsers to
     // check the session, so the only way to truly never show it is to not ask when
     // we don't have to. Returns true if it reused a token, false otherwise.
+    // captureGoogleEmailIfMissing: fetches and persists the account email if we
+    // don't have it yet. Called opportunistically after EVERY successful token
+    // acquisition (explicit sign-in, silent reauth, cached-token reuse) — not
+    // just once at initial sign-in. Root cause found 2026-07-22: this used to
+    // run only inline in handleGoogleSignIn; if that one userinfo fetch ever
+    // failed (network blip, ad blocker, etc.), googleEmail stayed null forever,
+    // and attemptSilentSignIn required googleEmail to even attempt a silent
+    // reauth — so a single missed fetch permanently disabled auto sign-in for
+    // that browser. Now it just keeps retrying on every subsequent success.
+    async function captureGoogleEmailIfMissing(token) {
+        if (googleEmail || !token)
+            return;
+        try {
+            const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            if (res.ok) {
+                const info = await res.json();
+                if (info.email)
+                    persistBackupMeta({ googleEmail: info.email });
+            }
+        }
+        catch (e) { }
+    }
     async function tryReuseCachedDriveToken() {
         try {
             const res = await window.storage.get(DRIVE_TOKEN_CACHE_KEY, false);
@@ -1052,6 +1066,7 @@ export default function FlashcardDrillApp() {
                 console.warn('[FlashDrill] cached token: valid, reusing');
                 setDriveAccessToken(cached.token);
                 setGoogleSignedIn(true);
+                captureGoogleEmailIfMissing(cached.token);
                 return true;
             }
             console.warn('[FlashDrill] cached token: present but expired', { expiresAt: cached && cached.expiresAt, now: Date.now() });
@@ -1076,7 +1091,11 @@ export default function FlashcardDrillApp() {
     // brief "One moment please" screen on some mobile browsers — expected to be
     // rare now since it only runs when there's no valid cached token left.
     async function attemptSilentSignIn() {
-        if (!driveConfigured() || !googleEmail || driveSignedOutByUser) {
+        // NOTE: googleEmail is NOT required here — it's only used as an optional
+        // login_hint (see requestDriveToken), not proof a session exists. Requiring
+        // it used to mean a one-time-missed userinfo fetch permanently blocked every
+        // future silent reauth. driveSignedOutByUser is the only real gate.
+        if (!driveConfigured() || driveSignedOutByUser) {
             // TEMP DEBUG: this early return produces NO console output and NO
             // caption by design elsewhere — which is exactly what was observed
             // (silent failure, nothing in console). Logging the actual values so
@@ -1091,6 +1110,7 @@ export default function FlashcardDrillApp() {
             setDriveAccessToken(token);
             setGoogleSignedIn(true);
             setDriveSilentDebug(null);
+            await captureGoogleEmailIfMissing(token);
         }
         catch (e) {
             // Expected whenever there's no active Google session in this browser —
