@@ -578,12 +578,6 @@ export default function FlashcardDrillApp() {
     const [driveAccessToken, setDriveAccessToken] = useState(null);
     const [driveBusy, setDriveBusy] = useState(false);
     const [driveNotice, setDriveNotice] = useState(null); // { tone: 'error'|'success'|'info', text }
-    // TEMP DEBUG (added 2026-07-22, remove once silent sign-in is root-caused):
-    // attemptSilentSignIn's real failure reason was being swallowed by an empty
-    // catch, so there was no way to see why it kept failing past the ~1hr cache
-    // window. This surfaces the raw error on-screen next to the sign-in button —
-    // screenshot it and it tells us exactly what Google returned.
-    const [driveSilentDebug, setDriveSilentDebug] = useState(null);
     const [pendingRestore, setPendingRestore] = useState(null); // { source: 'file'|'drive', payload }
     const [signInSyncPrompt, setSignInSyncPrompt] = useState(null); // { drivePayload } — shown only when local decks already exist at sign-in
     const tokenClientRef = useRef(null);
@@ -884,13 +878,11 @@ export default function FlashcardDrillApp() {
             tokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
                 client_id: GOOGLE_CLIENT_ID,
                 scope: DRIVE_SCOPE,
-                // Confirmed 2026-07-22: prompt:'none' was hanging forever with no
-                // callback at all. That's the classic symptom of the legacy silent
-                // check (a hidden iframe reading a 3rd-party accounts.google.com
-                // cookie) under Chrome's now-default third-party-cookie blocking —
-                // it doesn't fail cleanly, it just never responds. FedCM is Google's
-                // browser-mediated replacement for that same session check, so it
-                // isn't blocked by 3P-cookie restrictions the same way.
+                // Routes silent session checks through FedCM (browser-mediated)
+                // rather than the legacy hidden-iframe cookie check, which Chrome's
+                // third-party-cookie blocking can break silently. Kept even though
+                // it alone didn't resolve every case tested (see CONTEXT.md) — it's
+                // the more future-proof mechanism and has no downside.
                 use_fedcm_for_prompt: true,
                 callback: () => { }, // overridden per-call below
             });
@@ -911,9 +903,7 @@ export default function FlashcardDrillApp() {
             }
             try {
                 const client = await ensureTokenClient();
-                console.warn('[FlashDrill] GIS script + token client ready');
                 client.callback = (resp) => {
-                    console.warn('[FlashDrill] requestAccessToken callback fired:', resp && (resp.access_token ? 'got token' : resp.error || 'no-token'));
                     if (resp && resp.access_token) {
                         const expiresInSec = Number(resp.expires_in) || 3600;
                         persistDriveTokenCache(resp.access_token, Date.now() + expiresInSec * 1000);
@@ -930,11 +920,9 @@ export default function FlashcardDrillApp() {
                 const overrideConfig = { prompt: opts.silent ? 'none' : googleEmail ? '' : 'consent' };
                 if (opts.hint)
                     overrideConfig.login_hint = opts.hint;
-                console.warn('[FlashDrill] calling requestAccessToken with', overrideConfig);
                 client.requestAccessToken(overrideConfig);
             }
             catch (e) {
-                console.warn('[FlashDrill] ensureTokenClient/script load failed:', e && e.message);
                 reject(e);
             }
         });
@@ -966,7 +954,6 @@ export default function FlashcardDrillApp() {
             const token = await requestDriveToken();
             setDriveAccessToken(token);
             setGoogleSignedIn(true);
-            setDriveSilentDebug(null);
             persistBackupMeta({ driveSignedOutByUser: false });
             await captureGoogleEmailIfMissing(token);
             await syncAfterSignIn(token);
@@ -1030,7 +1017,6 @@ export default function FlashcardDrillApp() {
         setLastLocalBackupAt(null);
         setLastDriveBackupAt(null);
         setDriveNotice(null);
-        setDriveSilentDebug(null);
         setSelectedDeckId(null);
         setView('home');
     }
@@ -1069,23 +1055,17 @@ export default function FlashcardDrillApp() {
     async function tryReuseCachedDriveToken() {
         try {
             const res = await window.storage.get(DRIVE_TOKEN_CACHE_KEY, false);
-            if (!res || !res.value) {
-                console.warn('[FlashDrill] cached token: none stored');
+            if (!res || !res.value)
                 return false;
-            }
             const cached = JSON.parse(res.value);
             if (cached && cached.token && cached.expiresAt && cached.expiresAt - 120000 > Date.now()) {
-                console.warn('[FlashDrill] cached token: valid, reusing');
                 setDriveAccessToken(cached.token);
                 setGoogleSignedIn(true);
                 captureGoogleEmailIfMissing(cached.token);
                 return true;
             }
-            console.warn('[FlashDrill] cached token: present but expired', { expiresAt: cached && cached.expiresAt, now: Date.now() });
         }
-        catch (e) {
-            console.warn('[FlashDrill] cached token: read failed', e && e.message);
-        }
+        catch (e) { }
         return false;
     }
     // Quietly re-authenticates using the last-used account, with no popup, so the
@@ -1106,40 +1086,22 @@ export default function FlashcardDrillApp() {
         // NOTE: googleEmail is NOT required here — it's only used as an optional
         // login_hint (see requestDriveToken), not proof a session exists. Requiring
         // it used to mean a one-time-missed userinfo fetch permanently blocked every
+        // NOTE: googleEmail is NOT required here — it's only used as an optional
+        // login_hint (see requestDriveToken), not proof a session exists. Requiring
+        // it used to mean a one-time-missed userinfo fetch permanently blocked every
         // future silent reauth. driveSignedOutByUser is the only real gate.
-        if (!driveConfigured() || driveSignedOutByUser) {
-            // TEMP DEBUG: this early return produces NO console output and NO
-            // caption by design elsewhere — which is exactly what was observed
-            // (silent failure, nothing in console). Logging the actual values so
-            // we can see which condition is bailing instead of guessing.
-            const why = { configured: !!driveConfigured(), googleEmail, driveSignedOutByUser };
-            console.warn('[FlashDrill] silent sign-in SKIPPED (guard) —', why);
-            setDriveSilentDebug(`skipped: configured=${why.configured} email=${why.googleEmail} signedOutByUser=${why.driveSignedOutByUser} @ ${new Date().toLocaleTimeString()}`);
+        if (!driveConfigured() || driveSignedOutByUser)
             return;
-        }
         try {
-            // TEMP DEBUG: no guard-skip log and no catch log after cache-expired
-            // (2026-07-22) means the call below is neither resolving nor rejecting —
-            // Google's prompt:'none' callback simply never firing, a known GIS quirk.
-            // Race against a timeout so that failure mode surfaces instead of hanging
-            // silently forever.
-            const token = await Promise.race([
-                requestDriveToken({ silent: true, hint: googleEmail }),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('silent-timeout: Google never called back within 10s')), 10000)),
-            ]);
+            const token = await requestDriveToken({ silent: true, hint: googleEmail });
             setDriveAccessToken(token);
             setGoogleSignedIn(true);
-            setDriveSilentDebug(null);
             await captureGoogleEmailIfMissing(token);
         }
         catch (e) {
-            // Expected whenever there's no active Google session in this browser —
-            // just leave the "Continue with Google" button showing. TEMP: also
-            // capture what Google actually said, so we can see it on-screen instead
-            // of guessing (see driveSilentDebug above).
-            const msg = (e && e.message) || String(e) || 'unknown error';
-            console.warn('[FlashDrill] silent sign-in failed:', msg);
-            setDriveSilentDebug(`${msg} @ ${new Date().toLocaleTimeString()}`);
+            // Expected whenever there's no active Google session in this browser, or
+            // whenever Google's own silent-reauth check declines without erroring —
+            // just leave the "Continue with Google" button showing.
         }
     }
     async function driveFindBackupFileId(token) {
@@ -3359,7 +3321,7 @@ export default function FlashcardDrillApp() {
         React.createElement("div", { className: "flex items-center justify-between rounded-lg px-3 py-2 border-2", style: { borderColor: COLORS.rule } },
             React.createElement("span", { style: { ...fontStyle, color: COLORS.ink }, className: "text-xs font-bold flex items-center gap-2" }, darkMode ? React.createElement(Moon, { size: 14 }) : React.createElement(Sun, { size: 14 }), darkMode ? "Dark Mode" : "Light Mode"),
             React.createElement("button", { onClick: () => persistDarkMode(!darkMode), style: { backgroundColor: darkMode ? COLORS.ink : COLORS.rule }, className: "w-11 h-6 rounded-full relative transition-colors shrink-0" }, React.createElement("span", { className: "absolute top-0.5 w-5 h-5 rounded-full bg-white transition-all", style: { left: darkMode ? '20px' : '2px' } }))),
-        !googleSignedIn ? (React.createElement("button", { onClick: handleGoogleSignIn, disabled: driveBusy, style: { borderColor: COLORS.ink, color: COLORS.ink, ...fontStyle }, className: "w-full rounded-lg border-2 text-xs font-bold py-2 flex items-center justify-center gap-2 disabled:opacity-50" }, React.createElement(Cloud, { size: 13 }), driveBusy ? 'Connecting…' : 'Continue with Google')) : (React.createElement("div", { className: "w-full rounded-lg border-2 text-xs py-2 flex items-center justify-center gap-1", style: { borderColor: COLORS.rule, color: COLORS.green, ...monoStyle } }, React.createElement(Check, { size: 12 }), googleEmail || 'Signed in')), (!googleSignedIn && driveSilentDebug ? React.createElement("p", { style: { ...monoStyle, color: COLORS.inkFaint }, className: "text-[10px] text-center break-words" }, `silent sign-in: ${driveSilentDebug}`) : null)));
+        !googleSignedIn ? (React.createElement("button", { onClick: handleGoogleSignIn, disabled: driveBusy, style: { borderColor: COLORS.ink, color: COLORS.ink, ...fontStyle }, className: "w-full rounded-lg border-2 text-xs font-bold py-2 flex items-center justify-center gap-2 disabled:opacity-50" }, React.createElement(Cloud, { size: 13 }), driveBusy ? 'Connecting…' : 'Continue with Google')) : (React.createElement("div", { className: "w-full rounded-lg border-2 text-xs py-2 flex items-center justify-center gap-1", style: { borderColor: COLORS.rule, color: COLORS.green, ...monoStyle } }, React.createElement(Check, { size: 12 }), googleEmail || 'Signed in'))));
     // fallbackEl: shown if `content` never got assigned above (unknown/stale `view`).
     const fallbackEl = (React.createElement("div", { className: "flex flex-col gap-3" },
         React.createElement("p", { style: { ...fontStyle, color: COLORS.inkFaint }, className: "text-sm" }, "That screen isn't available anymore."),
