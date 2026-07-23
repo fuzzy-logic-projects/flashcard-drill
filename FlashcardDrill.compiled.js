@@ -615,12 +615,26 @@ export default function FlashcardDrillApp() {
     const [googleSignedIn, setGoogleSignedIn] = useState(false);
     const [googleEmail, setGoogleEmail] = useState(null);
     const [driveSignedOutByUser, setDriveSignedOutByUser] = useState(false);
+    // hasSignedInBefore: true once a real explicit Google sign-in has ever
+    // succeeded on this browser. Separate from googleEmail (which is only a
+    // login_hint and can go missing on a failed userinfo fetch) so it's a
+    // reliable gate for whether attemptSilentSignIn is even worth trying —
+    // see FUNCTION: STAY SIGNED IN. Reset to false whenever manual sign-out
+    // wipes storage, which is correct: right after sign-out there's nothing
+    // to silently reuse. Added 2026-07-23, see CONTEXT.md.
+    const [hasSignedInBefore, setHasSignedInBefore] = useState(false);
     const [driveAccessToken, setDriveAccessToken] = useState(null);
     const [driveBusy, setDriveBusy] = useState(false);
     const [driveNotice, setDriveNotice] = useState(null); // { tone: 'error'|'success'|'info', text }
     const [pendingRestore, setPendingRestore] = useState(null); // { source: 'file'|'drive', payload }
     const [signInSyncPrompt, setSignInSyncPrompt] = useState(null); // { drivePayload } — shown only when local decks already exist at sign-in
     const tokenClientRef = useRef(null);
+    // pendingSilentSignInRef: the in-flight Promise from attemptSilentSignIn,
+    // while one is running (mount check, 45-min refresh, or online-reconnect).
+    // requestDriveToken awaits this before issuing an explicit request on the
+    // same shared token client — see FUNCTION: STAY SIGNED IN and CONTEXT.md,
+    // "double sign-in" fix 2026-07-23.
+    const pendingSilentSignInRef = useRef(null);
     const restoreFileInputRef = useRef(null);
     const silentSignInAttemptedRef = useRef(false);
     const skipNextHistoryPushRef = useRef(false); // true while applying a popstate — avoids re-pushing the entry we just popped
@@ -765,6 +779,8 @@ export default function FlashcardDrillApp() {
                         setGoogleEmail(m.googleEmail);
                     if (typeof m.driveSignedOutByUser === 'boolean')
                         setDriveSignedOutByUser(m.driveSignedOutByUser);
+                    if (typeof m.hasSignedInBefore === 'boolean')
+                        setHasSignedInBefore(m.hasSignedInBefore);
                 }
             }
             catch (e) { }
@@ -825,6 +841,7 @@ export default function FlashcardDrillApp() {
             lastDriveBackupAt,
             googleEmail,
             driveSignedOutByUser,
+            hasSignedInBefore,
             ...patch,
         };
         if ('lastLocalBackupAt' in patch)
@@ -835,6 +852,8 @@ export default function FlashcardDrillApp() {
             setGoogleEmail(patch.googleEmail);
         if ('driveSignedOutByUser' in patch)
             setDriveSignedOutByUser(patch.driveSignedOutByUser);
+        if ('hasSignedInBefore' in patch)
+            setHasSignedInBefore(patch.hasSignedInBefore);
         try {
             await window.storage.set(BACKUP_META_KEY, JSON.stringify(next), false);
         }
@@ -941,6 +960,21 @@ export default function FlashcardDrillApp() {
                 reject(new Error('not-configured'));
                 return;
             }
+            // If a background silent check is still running (mount, 45-min
+            // refresh, or online-reconnect), wait for it to settle before
+            // touching the shared token client. Firing a second
+            // requestAccessToken() while one is already in flight overwrites
+            // the client's single callback slot, and Google ends up running
+            // the OAuth flow twice — the account picker/consent screen
+            // showing twice in a row. See CONTEXT.md, "double sign-in" fix
+            // 2026-07-23.
+            if (!opts.silent && pendingSilentSignInRef.current) {
+                const silentToken = await pendingSilentSignInRef.current;
+                if (silentToken) {
+                    resolve(silentToken);
+                    return;
+                }
+            }
             try {
                 const client = await ensureTokenClient();
                 client.callback = (resp) => {
@@ -994,7 +1028,7 @@ export default function FlashcardDrillApp() {
             const token = await requestDriveToken();
             setDriveAccessToken(token);
             setGoogleSignedIn(true);
-            persistBackupMeta({ driveSignedOutByUser: false });
+            persistBackupMeta({ driveSignedOutByUser: false, hasSignedInBefore: true });
             await captureGoogleEmailIfMissing(token);
             await syncAfterSignIn(token);
             setDriveNotice((prev) => prev || { tone: 'success', text: 'Signed in.' });
@@ -1054,6 +1088,7 @@ export default function FlashcardDrillApp() {
         setGoogleSignedIn(false);
         setGoogleEmail(null);
         setDriveSignedOutByUser(false);
+        setHasSignedInBefore(false);
         setLastLocalBackupAt(null);
         setLastDriveBackupAt(null);
         setDriveNotice(null);
@@ -1126,23 +1161,43 @@ export default function FlashcardDrillApp() {
         // NOTE: googleEmail is NOT required here — it's only used as an optional
         // login_hint (see requestDriveToken), not proof a session exists. Requiring
         // it used to mean a one-time-missed userinfo fetch permanently blocked every
-        // NOTE: googleEmail is NOT required here — it's only used as an optional
-        // login_hint (see requestDriveToken), not proof a session exists. Requiring
-        // it used to mean a one-time-missed userinfo fetch permanently blocked every
-        // future silent reauth. driveSignedOutByUser is the only real gate.
-        if (!driveConfigured() || driveSignedOutByUser)
-            return;
-        try {
-            const token = await requestDriveToken({ silent: true, hint: googleEmail });
-            setDriveAccessToken(token);
-            setGoogleSignedIn(true);
-            await captureGoogleEmailIfMissing(token);
-        }
-        catch (e) {
-            // Expected whenever there's no active Google session in this browser, or
-            // whenever Google's own silent-reauth check declines without erroring —
-            // just leave the "Continue with Google" button showing.
-        }
+        // future silent reauth. driveSignedOutByUser is the only real gate on
+        // whether we're ALLOWED to try. hasSignedInBefore is a separate gate on
+        // whether it's worth TRYING at all: a browser that has never completed a
+        // real sign-in has no session for Google to silently find, so prompt:'none'
+        // is guaranteed to fail — but it still visibly calls into Google first,
+        // which is what was flashing the "One moment please" screen (see image 1)
+        // for every first-time visitor and every logged-out reload. Skipping the
+        // call entirely when hasSignedInBefore is false removes that flash without
+        // touching driveSignedOutByUser's job. Fix 2026-07-23, see CONTEXT.md.
+        if (!driveConfigured() || driveSignedOutByUser || !hasSignedInBefore)
+            return null;
+        // Reuse an already-in-flight attempt (e.g. mount + online-reconnect firing
+        // close together) instead of starting a second one, and publish this one in
+        // pendingSilentSignInRef so requestDriveToken can wait on it rather than
+        // racing it with an overlapping requestAccessToken() call.
+        if (pendingSilentSignInRef.current)
+            return pendingSilentSignInRef.current;
+        const promise = (async () => {
+            try {
+                const token = await requestDriveToken({ silent: true, hint: googleEmail });
+                setDriveAccessToken(token);
+                setGoogleSignedIn(true);
+                await captureGoogleEmailIfMissing(token);
+                return token;
+            }
+            catch (e) {
+                // Expected whenever there's no active Google session in this browser, or
+                // whenever Google's own silent-reauth check declines without erroring —
+                // just leave the "Continue with Google" button showing.
+                return null;
+            }
+            finally {
+                pendingSilentSignInRef.current = null;
+            }
+        })();
+        pendingSilentSignInRef.current = promise;
+        return promise;
     }
     async function driveFindBackupFileId(token) {
         const q = encodeURIComponent(`name='${DRIVE_BACKUP_FILENAME}'`);
@@ -3754,6 +3809,30 @@ function SessionSummaryScreen({ colors: COLORS, cards, sessionPoolIds, sessionRe
     const [openHints, setOpenHints] = useState(() => new Set());
     const [openSolutions, setOpenSolutions] = useState(() => new Set());
     const [doneVisible, setDoneVisible] = useState(true);
+    // chromeInsetPx: how many px of the bottom of the true visible viewport are
+    // currently covered by the browser's own UI (address bar / bottom toolbar,
+    // on-screen nav gestures, etc). `position:fixed; bottom:0` is anchored to the
+    // full layout viewport, not the currently-visible one — on browsers/WebViews
+    // whose bottom chrome isn't collapsed, the fixed Done bar can end up rendered
+    // underneath that chrome instead of above it ("going out of screen" — see
+    // CONTEXT.md, fixed 2026-07-23). visualViewport reports the actually-visible
+    // area, so we measure the gap and add it as extra bottom offset.
+    const [chromeInsetPx, setChromeInsetPx] = useState(0);
+    useEffect(() => {
+        const vv = window.visualViewport;
+        if (!vv)
+            return;
+        const updateInset = () => {
+            setChromeInsetPx(Math.max(0, window.innerHeight - vv.height - vv.offsetTop));
+        };
+        updateInset();
+        vv.addEventListener('resize', updateInset);
+        vv.addEventListener('scroll', updateInset);
+        return () => {
+            vv.removeEventListener('resize', updateInset);
+            vv.removeEventListener('scroll', updateInset);
+        };
+    }, []);
     const lastScrollYRef = useRef(0);
     useEffect(() => {
         lastScrollYRef.current = window.scrollY || 0;
@@ -3870,7 +3949,7 @@ function SessionSummaryScreen({ colors: COLORS, cards, sessionPoolIds, sessionRe
                     React.createElement(MathText, { text: it.solution }))) : null));
         })),
         React.createElement("div", { className: "h-24", "aria-hidden": "true" }),
-        React.createElement("div", { className: "fixed inset-x-0 bottom-0 z-20 flex justify-center pointer-events-none" },
+        React.createElement("div", { className: "fixed inset-x-0 bottom-0 z-20 flex justify-center pointer-events-none", style: { bottom: `${chromeInsetPx}px` } },
             React.createElement("div", { className: "done-bar w-full max-w-sm md:max-w-lg pointer-events-auto", style: {
                     backgroundColor: COLORS.paper,
                     borderTop: `2px solid ${COLORS.rule}`,
