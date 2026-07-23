@@ -103,7 +103,19 @@ const DRIVE_TOKEN_CACHE_KEY = 'flashdrill:v2:driveTokenCache';
 // JavaScript origin for this client ID. See the setup notes in the Backup screen.
 const GOOGLE_CLIENT_ID = '790736366293-a7dlgr671caebbam0gu5kkkot8tbmcn0.apps.googleusercontent.com';
 const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.appdata';
+// DRIVE_BACKUP_FILENAME: the OLD single-file backup name. Kept only as a
+// migration source (FUNCTION: RESTORE ON SIGN-IN reads it once, the first
+// time decks.json doesn't exist yet) and as a dormant safety net — nothing
+// writes to it anymore. See "Target Drive file layout" in CONTEXT.md.
 const DRIVE_BACKUP_FILENAME = 'flashdrill-backup.json';
+// ---- Sharded Drive file layout (replaces the single flashdrill-backup.json
+// above) — one small file per deck instead of one ever-growing blob, so an
+// edit in one deck only rewrites that deck's files. See "Target Drive file
+// layout" / "What triggers which file write" in CONTEXT.md, Persistence.
+const DRIVE_DECKS_FILENAME = 'decks.json';
+const DRIVE_SETTINGS_FILENAME = 'settings.json';
+function driveCardsFilename(deckId) { return `deck-${deckId}-cards.json`; }
+function driveNotesFilename(deckId) { return `deck-${deckId}-notes.json`; }
 const BACKUP_VERSION = 2;
 const SAMPLE_TEXT = `$Who is known as the chief architect of the Indian Constitution?
 @Dr. B. R. Ambedkar
@@ -645,6 +657,18 @@ export default function FlashcardDrillApp() {
     const questionShownAtRef = useRef(null); // timestamp the current question appeared, for difficulty timing
     const cardsRef = useRef(cards); // always-current mirror of `cards`, read inside effects that must NOT re-run just because card metadata (sr/difficulty) changed — see the options-regen effect below
     cardsRef.current = cards;
+    // driveFileIdCacheRef: filename -> Drive file id, populated by driveListAppFiles
+    // (the one files.list call at sign-in) and by every upload/create response after
+    // that, so repeat writes to the same file (decks.json, a deck's cards.json, etc.)
+    // don't need a separate lookup call first. Not React state — nothing renders off
+    // it, it's pure bookkeeping for FUNCTIONS: GOOGLE SIGN-IN below.
+    const driveFileIdCacheRef = useRef({});
+    // deckSyncMetaRef: per-deck { cardsModifiedTime, notesModifiedTime } — the Drive
+    // modifiedTime this device last saw (pushed OR pulled) for each deck's sharded
+    // files. Lets FUNCTION: RESTORE ON SIGN-IN skip re-fetching a deck whose Drive
+    // files haven't changed since last time. Mirrored to BACKUP_META_KEY via
+    // persistBackupMeta so it survives a reload; loaded back into this ref on mount.
+    const deckSyncMetaRef = useRef({});
     // Edit Zone (Settings → Categories → Decks → Cards) state
     const [editZoneLevel, setEditZoneLevel] = useState('categories'); // 'categories' | 'decks' | 'cards'
     const [editZoneCategory, setEditZoneCategory] = useState(null);
@@ -784,6 +808,8 @@ export default function FlashcardDrillApp() {
                         setDriveSignedOutByUser(m.driveSignedOutByUser);
                     if (typeof m.hasSignedInBefore === 'boolean')
                         setHasSignedInBefore(m.hasSignedInBefore);
+                    if (m.deckSync && typeof m.deckSync === 'object')
+                        deckSyncMetaRef.current = m.deckSync;
                 }
             }
             catch (e) { }
@@ -845,6 +871,7 @@ export default function FlashcardDrillApp() {
             googleEmail,
             driveSignedOutByUser,
             hasSignedInBefore,
+            deckSync: deckSyncMetaRef.current,
             ...patch,
         };
         if ('lastLocalBackupAt' in patch)
@@ -857,10 +884,21 @@ export default function FlashcardDrillApp() {
             setDriveSignedOutByUser(patch.driveSignedOutByUser);
         if ('hasSignedInBefore' in patch)
             setHasSignedInBefore(patch.hasSignedInBefore);
+        if ('deckSync' in patch)
+            deckSyncMetaRef.current = patch.deckSync;
         try {
             await window.storage.set(BACKUP_META_KEY, JSON.stringify(next), false);
         }
         catch (e) { }
+    }
+    // recordDeckSyncMeta: merges a { cardsModifiedTime?, notesModifiedTime? } patch
+    // for one deck into deckSyncMetaRef and persists it. Called after every Drive
+    // write AND every Drive read of a deck's cards/notes files, so the bookkeeping
+    // always reflects the most recent modifiedTime this device has actually seen —
+    // see FUNCTION: RESTORE ON SIGN-IN for how it's used to skip unchanged decks.
+    function recordDeckSyncMeta(deckId, patch) {
+        const nextDeckSync = { ...deckSyncMetaRef.current, [deckId]: { ...deckSyncMetaRef.current[deckId], ...patch } };
+        persistBackupMeta({ deckSync: nextDeckSync });
     }
     // ---------- Local backup (fully works right here in the preview) ----------
     // ===== FUNCTIONS: LOCAL BACKUP FILE (search: FUNCTIONS: LOCAL BACKUP FILE) =====
@@ -1087,7 +1125,7 @@ export default function FlashcardDrillApp() {
     async function handleGoogleSignOut() {
         if (driveAccessToken) {
             try {
-                await driveBackupNow(true);
+                await driveBackupNow(true, { full: true });
             }
             catch (e) { }
         }
@@ -1222,40 +1260,166 @@ export default function FlashcardDrillApp() {
             return null;
         }
     }
-    async function driveFindBackupFileId(token) {
-        const q = encodeURIComponent(`name='${DRIVE_BACKUP_FILENAME}'`);
+    // driveListAppFiles: lists every file in the app's hidden Drive folder in one
+    // request — id, name, modifiedTime for each. Populates driveFileIdCacheRef so
+    // later uploads in the same flow skip a separate per-file lookup, and gives
+    // FUNCTION: RESTORE ON SIGN-IN what it needs to decide which per-deck files
+    // actually changed since last sync. Returns a Map keyed by filename.
+    async function driveListAppFiles(token) {
+        const res = await fetch(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&fields=files(id,name,modifiedTime)&pageSize=1000`, { headers: { Authorization: `Bearer ${token}` } });
+        if (!res.ok)
+            throw new Error('drive-list-failed');
+        const data = await res.json();
+        const byName = new Map();
+        (data.files || []).forEach((f) => {
+            byName.set(f.name, f);
+            driveFileIdCacheRef.current[f.name] = f.id;
+        });
+        return byName;
+    }
+    // driveFindFileIdByName: id for one named file — cache hit if driveListAppFiles
+    // or a prior upload already saw it this session, else a single targeted lookup.
+    async function driveFindFileIdByName(token, filename) {
+        if (driveFileIdCacheRef.current[filename])
+            return driveFileIdCacheRef.current[filename];
+        const q = encodeURIComponent(`name='${filename}'`);
         const res = await fetch(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${q}&fields=files(id,modifiedTime)`, { headers: { Authorization: `Bearer ${token}` } });
         if (!res.ok)
             throw new Error('drive-list-failed');
         const data = await res.json();
-        return data.files && data.files.length ? data.files[0].id : null;
+        const id = data.files && data.files.length ? data.files[0].id : null;
+        if (id)
+            driveFileIdCacheRef.current[filename] = id;
+        return id;
+    }
+    // driveUploadNamedFile: writes one JSON file to the app's hidden Drive folder —
+    // creates it (POST) the first time, overwrites in place (PATCH) after. This is
+    // the sharded-file replacement for the old single-file multipart upload that
+    // used to live inline in driveBackupNow. Returns {id, modifiedTime} (requested
+    // via `fields=`) so callers can cache the id and record Drive's own modifiedTime
+    // — see recordDeckSyncMeta — instead of trusting the local clock.
+    async function driveUploadNamedFile(token, filename, payload) {
+        const existingId = await driveFindFileIdByName(token, filename);
+        const metadata = { name: filename, mimeType: 'application/json', parents: existingId ? undefined : ['appDataFolder'] };
+        const boundary = 'flashdrill_boundary';
+        const body = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n` +
+            `--${boundary}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(payload)}\r\n--${boundary}--`;
+        const url = existingId
+            ? `https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=multipart&fields=id,modifiedTime`
+            : 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,modifiedTime';
+        const res = await fetch(url, {
+            method: existingId ? 'PATCH' : 'POST',
+            headers: { Authorization: `Bearer ${token}`, 'Content-Type': `multipart/related; boundary=${boundary}` },
+            body,
+        });
+        if (!res.ok)
+            throw new Error('drive-upload-failed');
+        const result = await res.json();
+        if (result && result.id)
+            driveFileIdCacheRef.current[filename] = result.id;
+        return result;
+    }
+    // driveDeleteNamedFile: best-effort delete of one named file, by id if already
+    // known (idHint) to skip a lookup. Used only for orphan cleanup — see
+    // cleanupOrphanedDeckFiles / "Open edge case" in CONTEXT.md.
+    async function driveDeleteNamedFile(token, filename, idHint) {
+        try {
+            const id = idHint !== undefined ? idHint : await driveFindFileIdByName(token, filename);
+            if (!id)
+                return;
+            await fetch(`https://www.googleapis.com/drive/v3/files/${id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+            delete driveFileIdCacheRef.current[filename];
+        }
+        catch (e) { }
+    }
+    // driveFetchJson: downloads and parses one Drive file's content by id.
+    async function driveFetchJson(token, fileId) {
+        const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, { headers: { Authorization: `Bearer ${token}` } });
+        if (!res.ok)
+            throw new Error('drive-download-failed');
+        return res.json();
+    }
+    // cleanupOrphanedDeckFiles: deletes any deck-{id}-cards.json / deck-{id}-notes.json
+    // still on Drive for a deck that no longer exists in `keepDecks`. Needed because
+    // whole-deck deletion deliberately skips auto-backup (same as every other
+    // deletion — see FUNCTIONS: EDIT ZONE), so once files are sharded per deck, a
+    // deleted deck's own files would otherwise never get cleaned up. Runs as part of
+    // sign-in reconciliation rather than at delete time, so deletions keep their
+    // existing "nothing reaches Drive until a manual/auto backup" behavior — see
+    // "Open edge case" in CONTEXT.md. Best-effort: a failed cleanup just leaves a
+    // harmless orphaned file for next time.
+    async function cleanupOrphanedDeckFiles(token, filesByName, keepDecks) {
+        const keepIds = new Set((keepDecks || []).map((d) => d.id));
+        const jobs = [];
+        filesByName.forEach((file, name) => {
+            const cardsMatch = /^deck-(.+)-cards\.json$/.exec(name);
+            const notesMatch = /^deck-(.+)-notes\.json$/.exec(name);
+            const deckId = (cardsMatch && cardsMatch[1]) || (notesMatch && notesMatch[1]);
+            if (deckId && !keepIds.has(deckId)) {
+                jobs.push(driveDeleteNamedFile(token, name, file.id));
+            }
+        });
+        await Promise.all(jobs);
     }
     // ===== FUNCTION: BACK UP TO DRIVE (search: FUNCTION: BACK UP TO DRIVE) =====
-    // driveBackupNow: uploads the current decks/cards to Google Drive's hidden
-    // app folder, overwriting the previous backup file (never creates a
-    // duplicate). silent=true means no success/error message is shown —
-    // used for automatic background backups.
-    async function driveBackupNow(silent, overrideDecks, overrideCards, overrideNotes) {
+    // driveBackupNow: uploads only what actually changed to the app's hidden Drive
+    // folder — decks.json, settings.json, and/or one deck's cards.json/notes.json,
+    // per `scope` — instead of the old single flashdrill-backup.json blob resent in
+    // full on every edit. See "Target Drive file layout" / "What triggers which
+    // file write" in CONTEXT.md, Persistence. silent=true means no success/error
+    // message is shown — used for automatic background backups.
+    //   scope.full === true        -> every file: decks.json, settings.json, and
+    //                                  every deck's cards.json (+ notes.json if it
+    //                                  has notes). Used by the manual "Back Up Now"
+    //                                  button, sign-out's last backup, and the push
+    //                                  after a sign-in merge/rewrite.
+    //   scope.decks === true       -> decks.json only.
+    //   scope.settings === true    -> settings.json only.
+    //   scope.cards + scope.deckId -> that one deck's cards.json only.
+    //   scope.notes + scope.deckId -> that one deck's notes.json only.
+    // Any combination of the scoped flags may be set together (e.g. a rating change
+    // sets {notes:true, deckId}). overrideDecks/overrideCards/overrideNotes/
+    // overrideSettings: freshly computed values to use instead of state, same
+    // reasoning as before — so a just-computed value can be sent immediately
+    // without waiting on state to propagate first.
+    async function driveBackupNow(silent, scope, overrideDecks, overrideCards, overrideNotes, overrideSettings) {
         if (!silent)
             setDriveNotice(null);
         setDriveBusy(true);
-        const payload = buildBackupPayload(overrideDecks || decks, overrideCards || cards, overrideNotes || notes, { cycleSize });
+        const decksNow = overrideDecks || decks;
+        const cardsNow = overrideCards || cards;
+        const notesNow = overrideNotes || notes;
+        const settingsNow = overrideSettings !== undefined ? overrideSettings : cycleSize;
         const attemptUpload = async (token) => {
-            const existingId = await driveFindBackupFileId(token);
-            const metadata = { name: DRIVE_BACKUP_FILENAME, mimeType: 'application/json', parents: existingId ? undefined : ['appDataFolder'] };
-            const boundary = 'flashdrill_boundary';
-            const body = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n` +
-                `--${boundary}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(payload)}\r\n--${boundary}--`;
-            const url = existingId
-                ? `https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=multipart`
-                : 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
-            const res = await fetch(url, {
-                method: existingId ? 'PATCH' : 'POST',
-                headers: { Authorization: `Bearer ${token}`, 'Content-Type': `multipart/related; boundary=${boundary}` },
-                body,
-            });
-            if (!res.ok)
-                throw new Error('drive-upload-failed');
+            const jobs = [];
+            if (scope.full || scope.decks) {
+                jobs.push(driveUploadNamedFile(token, DRIVE_DECKS_FILENAME, decksNow));
+            }
+            if (scope.full || scope.settings) {
+                jobs.push(driveUploadNamedFile(token, DRIVE_SETTINGS_FILENAME, { cycleSize: settingsNow }));
+            }
+            if (scope.full) {
+                decksNow.forEach((d) => {
+                    jobs.push(driveUploadNamedFile(token, driveCardsFilename(d.id), cardsNow.filter((c) => c.deckId === d.id))
+                        .then((r) => recordDeckSyncMeta(d.id, { cardsModifiedTime: r && r.modifiedTime })));
+                    const deckNotes = notesNow.filter((n) => n.deckId === d.id);
+                    if (deckNotes.length) {
+                        jobs.push(driveUploadNamedFile(token, driveNotesFilename(d.id), deckNotes)
+                            .then((r) => recordDeckSyncMeta(d.id, { notesModifiedTime: r && r.modifiedTime })));
+                    }
+                });
+            }
+            else {
+                if (scope.cards && scope.deckId) {
+                    jobs.push(driveUploadNamedFile(token, driveCardsFilename(scope.deckId), cardsNow.filter((c) => c.deckId === scope.deckId))
+                        .then((r) => recordDeckSyncMeta(scope.deckId, { cardsModifiedTime: r && r.modifiedTime })));
+                }
+                if (scope.notes && scope.deckId) {
+                    jobs.push(driveUploadNamedFile(token, driveNotesFilename(scope.deckId), notesNow.filter((n) => n.deckId === scope.deckId))
+                        .then((r) => recordDeckSyncMeta(scope.deckId, { notesModifiedTime: r && r.modifiedTime })));
+                }
+            }
+            await Promise.all(jobs);
         };
         try {
             let token = driveAccessToken;
@@ -1293,10 +1457,57 @@ export default function FlashcardDrillApp() {
     // triggerAutoBackup: called after any real data change (new deck, import,
     // rename, card edit, note import/edit/rating). Deliberately NOT called after
     // deletions — see deleteDeck/deleteCategory/deleteSingleCard/deleteNote below.
-    function triggerAutoBackup(overrideDecks, overrideCards, overrideNotes) {
+    // scope: see driveBackupNow above — every call site already knows which single
+    // deck it touched, so it passes { decks: true } / { cards: true, deckId } /
+    // { notes: true, deckId } as appropriate instead of full-array overrides.
+    function triggerAutoBackup(scope, overrideDecks, overrideCards, overrideNotes, overrideSettings) {
         if (googleSignedIn) {
-            driveBackupNow(true, overrideDecks, overrideCards, overrideNotes);
+            driveBackupNow(true, scope, overrideDecks, overrideCards, overrideNotes, overrideSettings);
         }
+    }
+    // migrateLegacyDriveBackupIfNeeded: one-time migration to the sharded layout.
+    // If decks.json doesn't exist yet but the old single flashdrill-backup.json
+    // does, split it into decks.json/settings.json/per-deck files and upload those.
+    // The old file is deliberately left in place afterward as a dormant safety net
+    // — nothing reads it once migration has run. See "One-time migration from the
+    // old format" in CONTEXT.md. Mutates filesByName in place with the newly
+    // created files so the caller's listing reflects them without a second Drive
+    // round trip.
+    async function migrateLegacyDriveBackupIfNeeded(token, filesByName) {
+        if (filesByName.has(DRIVE_DECKS_FILENAME))
+            return; // already on the new format
+        const legacy = filesByName.get(DRIVE_BACKUP_FILENAME);
+        if (!legacy)
+            return; // nothing backed up at all yet, in either format
+        const parsed = await driveFetchJson(token, legacy.id);
+        if (validateBackupShape(parsed))
+            return; // corrupt/unrecognized legacy file — leave it alone, nothing to migrate
+        const legacyDecks = Array.isArray(parsed.decks) ? parsed.decks : [];
+        const legacyCards = Array.isArray(parsed.cards) ? parsed.cards : [];
+        const legacyNotes = Array.isArray(parsed.notes) ? parsed.notes : [];
+        filesByName.set(DRIVE_DECKS_FILENAME, await driveUploadNamedFile(token, DRIVE_DECKS_FILENAME, legacyDecks));
+        filesByName.set(DRIVE_SETTINGS_FILENAME, await driveUploadNamedFile(token, DRIVE_SETTINGS_FILENAME, parsed.settings || { cycleSize }));
+        await Promise.all(legacyDecks.map(async (d) => {
+            filesByName.set(driveCardsFilename(d.id), await driveUploadNamedFile(token, driveCardsFilename(d.id), legacyCards.filter((c) => c.deckId === d.id)));
+            const deckNotes = legacyNotes.filter((n) => n.deckId === d.id);
+            if (deckNotes.length) {
+                filesByName.set(driveNotesFilename(d.id), await driveUploadNamedFile(token, driveNotesFilename(d.id), deckNotes));
+            }
+        }));
+    }
+    // driveFetchDeckCardsNotes: reads one deck's cards.json/notes.json (whichever
+    // exist in filesByName), used by every restore path below.
+    async function driveFetchDeckCardsNotes(token, deckId, filesByName) {
+        const cardsFile = filesByName.get(driveCardsFilename(deckId));
+        const notesFile = filesByName.get(driveNotesFilename(deckId));
+        const deckCards = cardsFile ? await driveFetchJson(token, cardsFile.id) : [];
+        const deckNotes = notesFile ? await driveFetchJson(token, notesFile.id) : [];
+        return {
+            cards: Array.isArray(deckCards) ? deckCards : [],
+            notes: Array.isArray(deckNotes) ? deckNotes : [],
+            cardsModifiedTime: cardsFile && cardsFile.modifiedTime,
+            notesModifiedTime: notesFile && notesFile.modifiedTime,
+        };
     }
     // Runs right after a successful sign-in. If there's no local data, restore Drive's
     // backup automatically. If local decks already exist, merge automatically unless
@@ -1308,35 +1519,40 @@ export default function FlashcardDrillApp() {
     // on duplicate cards/notes, see mergeByRecency) whenever at most one side has
     // decks the other lacks; only asks Keep & Merge vs. Rewrite (see
     // applySignInRewrite / applySignInMerge below) when both sides have decks the
-    // other doesn't.
+    // other doesn't. On an auto-merge, a deck's cards.json/notes.json is only
+    // re-fetched if its Drive modifiedTime is newer than what deckSyncMetaRef last
+    // recorded for it (or it's a deck this device has never seen) — see "Restore /
+    // merge logic" in CONTEXT.md. This full comparison only runs here (sign-in /
+    // explicit restore), never on every edit.
     async function syncAfterSignIn(token) {
         try {
-            const fileId = await driveFindBackupFileId(token);
-            if (!fileId)
-                return; // nothing backed up yet — nothing to sync
-            const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
-                headers: { Authorization: `Bearer ${token}` },
-            });
-            if (!res.ok)
+            const filesByName = await driveListAppFiles(token);
+            await migrateLegacyDriveBackupIfNeeded(token, filesByName);
+            const decksFile = filesByName.get(DRIVE_DECKS_FILENAME);
+            if (!decksFile)
+                return; // nothing backed up yet, in either format — nothing to sync
+            const driveDecks = await driveFetchJson(token, decksFile.id);
+            if (!Array.isArray(driveDecks))
                 return;
-            const parsed = await res.json();
-            if (validateBackupShape(parsed))
-                return;
+            const settingsFile = filesByName.get(DRIVE_SETTINGS_FILENAME);
+            const driveSettings = settingsFile ? await driveFetchJson(token, settingsFile.id) : null;
             if (decks.length === 0) {
-                persistDecks(Array.isArray(parsed.decks) ? parsed.decks : []);
-                persistCards(Array.isArray(parsed.cards) ? parsed.cards : []);
-                persistNotes(Array.isArray(parsed.notes) ? parsed.notes : []);
-                if (parsed.settings)
-                    persistSettings(parsed.settings.cycleSize || cycleSize);
+                // Nothing local yet — full restore, one deck's files at a time.
+                const perDeck = await Promise.all(driveDecks.map(async (d) => ({ deckId: d.id, ...(await driveFetchDeckCardsNotes(token, d.id, filesByName)) })));
+                persistDecks(driveDecks);
+                persistCards(perDeck.flatMap((p) => p.cards));
+                persistNotes(perDeck.flatMap((p) => p.notes));
+                if (driveSettings)
+                    persistSettings(driveSettings.cycleSize || cycleSize);
+                const nextDeckSync = {};
+                perDeck.forEach((p) => { nextDeckSync[p.deckId] = { cardsModifiedTime: p.cardsModifiedTime, notesModifiedTime: p.notesModifiedTime }; });
+                persistBackupMeta({ deckSync: nextDeckSync });
                 setDriveNotice({ tone: 'success', text: 'Restored your decks from Google Drive.' });
                 setTimeout(() => {
                     setDriveNotice((prev) => (prev && prev.text === 'Restored your decks from Google Drive.' ? null : prev));
                 }, 5000);
                 return;
             }
-            const driveDecks = Array.isArray(parsed.decks) ? parsed.decks : [];
-            const driveCards = Array.isArray(parsed.cards) ? parsed.cards : [];
-            const driveNotesIn = Array.isArray(parsed.notes) ? parsed.notes : [];
             // Only interrupt sign-in with a prompt when BOTH sides have a deck the
             // other side lacks — that's the one case with no lossless default,
             // since picking either side alone would silently drop a whole deck. If
@@ -1349,16 +1565,51 @@ export default function FlashcardDrillApp() {
             const hasLocalOnlyDeck = decks.some((d) => !driveKeySet.has(deckKey(d)));
             const hasDriveOnlyDeck = driveDecks.some((d) => !localKeySet.has(deckKey(d)));
             if (hasLocalOnlyDeck && hasDriveOnlyDeck) {
-                setSignInSyncPrompt({ drivePayload: parsed });
+                // A genuine two-way conflict — fetch every Drive deck's cards/notes now
+                // so Keep & Merge / Rewrite below have everything already in hand, no
+                // further round trip once the person picks one.
+                const perDeck = await Promise.all(driveDecks.map((d) => driveFetchDeckCardsNotes(token, d.id, filesByName)));
+                const drivePayload = {
+                    decks: driveDecks,
+                    cards: perDeck.flatMap((p) => p.cards),
+                    notes: perDeck.flatMap((p) => p.notes),
+                    settings: driveSettings || { cycleSize },
+                    exportedAt: decksFile.modifiedTime,
+                };
+                setSignInSyncPrompt({ drivePayload, filesByName });
                 setView('backup');
                 return;
             }
-            const merged = mergeBackups(decks, cards, notes, driveDecks, driveCards, driveNotesIn);
+            // Auto-merge: skip re-fetching a deck's cards/notes when its Drive files
+            // haven't changed since we last synced them — the local copy already
+            // reflects everything Drive has for that deck.
+            const deckSync = deckSyncMetaRef.current || {};
+            const perDeck = await Promise.all(driveDecks.map(async (d) => {
+                const cardsFile = filesByName.get(driveCardsFilename(d.id));
+                const notesFile = filesByName.get(driveNotesFilename(d.id));
+                const meta = deckSync[d.id];
+                const cardsChanged = !meta || !meta.cardsModifiedTime || (cardsFile && cardsFile.modifiedTime > meta.cardsModifiedTime);
+                const notesChanged = !meta || !meta.notesModifiedTime || (notesFile && notesFile.modifiedTime > meta.notesModifiedTime);
+                const deckCards = cardsChanged && cardsFile ? await driveFetchJson(token, cardsFile.id) : [];
+                const deckNotes = notesChanged && notesFile ? await driveFetchJson(token, notesFile.id) : [];
+                return {
+                    deckId: d.id,
+                    cards: Array.isArray(deckCards) ? deckCards : [],
+                    notes: Array.isArray(deckNotes) ? deckNotes : [],
+                    cardsModifiedTime: cardsFile ? cardsFile.modifiedTime : (meta && meta.cardsModifiedTime),
+                    notesModifiedTime: notesFile ? notesFile.modifiedTime : (meta && meta.notesModifiedTime),
+                };
+            }));
+            const merged = mergeBackups(decks, cards, notes, driveDecks, perDeck.flatMap((p) => p.cards), perDeck.flatMap((p) => p.notes));
             persistDecks(merged.decks);
             persistCards(merged.cards);
             persistNotes(merged.notes);
+            const nextDeckSync = { ...deckSync };
+            perDeck.forEach((p) => { nextDeckSync[p.deckId] = { cardsModifiedTime: p.cardsModifiedTime, notesModifiedTime: p.notesModifiedTime }; });
+            persistBackupMeta({ deckSync: nextDeckSync });
             setDriveNotice({ tone: 'success', text: 'Synced with Google Drive.' });
-            driveBackupNow(true, merged.decks, merged.cards, merged.notes);
+            driveBackupNow(true, { full: true }, merged.decks, merged.cards, merged.notes);
+            cleanupOrphanedDeckFiles(token, filesByName, merged.decks);
         }
         catch (e) {
             // Sign-in itself still succeeded even if this sync step failed silently.
@@ -1367,19 +1618,21 @@ export default function FlashcardDrillApp() {
     function applySignInRewrite() {
         if (!signInSyncPrompt)
             return;
-        const { drivePayload } = signInSyncPrompt;
+        const { drivePayload, filesByName } = signInSyncPrompt;
         persistDecks(Array.isArray(drivePayload.decks) ? drivePayload.decks : []);
         persistCards(Array.isArray(drivePayload.cards) ? drivePayload.cards : []);
         persistNotes(Array.isArray(drivePayload.notes) ? drivePayload.notes : []);
         if (drivePayload.settings)
             persistSettings(drivePayload.settings.cycleSize || cycleSize);
+        if (driveAccessToken && filesByName)
+            cleanupOrphanedDeckFiles(driveAccessToken, filesByName, drivePayload.decks || []);
         setSignInSyncPrompt(null);
         setDriveNotice({ tone: 'success', text: 'Replaced local data with your Drive backup.' });
     }
     function applySignInMerge() {
         if (!signInSyncPrompt)
             return;
-        const { drivePayload } = signInSyncPrompt;
+        const { drivePayload, filesByName } = signInSyncPrompt;
         const driveDecks = Array.isArray(drivePayload.decks) ? drivePayload.decks : [];
         const driveCards = Array.isArray(drivePayload.cards) ? drivePayload.cards : [];
         const driveNotesIn = Array.isArray(drivePayload.notes) ? drivePayload.notes : [];
@@ -1389,9 +1642,16 @@ export default function FlashcardDrillApp() {
         persistNotes(merged.notes);
         setSignInSyncPrompt(null);
         setDriveNotice({ tone: 'success', text: 'Merged local decks with your Drive backup.' });
-        driveBackupNow(true, merged.decks, merged.cards, merged.notes);
+        driveBackupNow(true, { full: true }, merged.decks, merged.cards, merged.notes);
+        if (driveAccessToken && filesByName)
+            cleanupOrphanedDeckFiles(driveAccessToken, filesByName, merged.decks);
     }
-    // driveRestoreNow: the manual "Restore" button in Backup & Restore — pulls the Drive backup down and asks for confirmation before replacing local data.
+    // driveRestoreNow: the manual "Restore" button in Backup & Restore — pulls every
+    // sharded Drive file down (decks.json, settings.json, each deck's cards.json/
+    // notes.json — or the old single-file backup if this account hasn't migrated
+    // yet), reassembles the same {decks,cards,notes,settings} shape the rest of the
+    // restore UI already expects, and asks for confirmation before replacing local
+    // data (applyPendingRestore, unchanged).
     async function driveRestoreNow() {
         setDriveNotice(null);
         setDriveBusy(true);
@@ -1399,25 +1659,40 @@ export default function FlashcardDrillApp() {
             let token = driveAccessToken;
             if (!token)
                 token = await requestDriveToken();
-            const fileId = await driveFindBackupFileId(token);
-            if (!fileId) {
-                setDriveNotice({ tone: 'error', text: 'No backup found in Google Drive yet.' });
-                return;
+            const filesByName = await driveListAppFiles(token);
+            const decksFile = filesByName.get(DRIVE_DECKS_FILENAME);
+            let payload;
+            if (decksFile) {
+                const driveDecks = await driveFetchJson(token, decksFile.id);
+                const settingsFile = filesByName.get(DRIVE_SETTINGS_FILENAME);
+                const driveSettings = settingsFile ? await driveFetchJson(token, settingsFile.id) : null;
+                const perDeck = await Promise.all((Array.isArray(driveDecks) ? driveDecks : []).map((d) => driveFetchDeckCardsNotes(token, d.id, filesByName)));
+                payload = {
+                    app: 'flashdrill',
+                    version: BACKUP_VERSION,
+                    exportedAt: decksFile.modifiedTime,
+                    decks: Array.isArray(driveDecks) ? driveDecks : [],
+                    cards: perDeck.flatMap((p) => p.cards),
+                    notes: perDeck.flatMap((p) => p.notes),
+                    settings: driveSettings || { cycleSize },
+                };
             }
-            const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
-                headers: { Authorization: `Bearer ${token}` },
-            });
-            if (!res.ok)
-                throw new Error('drive-download-failed');
-            const parsed = await res.json();
-            const err = validateBackupShape(parsed);
+            else {
+                const legacy = filesByName.get(DRIVE_BACKUP_FILENAME);
+                if (!legacy) {
+                    setDriveNotice({ tone: 'error', text: 'No backup found in Google Drive yet.' });
+                    return;
+                }
+                payload = await driveFetchJson(token, legacy.id);
+            }
+            const err = validateBackupShape(payload);
             if (err) {
                 setDriveNotice({ tone: 'error', text: err });
                 return;
             }
             setDriveAccessToken(token);
             setGoogleSignedIn(true);
-            setPendingRestore({ source: 'drive', payload: parsed });
+            setPendingRestore({ source: 'drive', payload });
         }
         catch (e) {
             setDriveNotice({ tone: 'error', text: 'Couldn\u2019t reach Google Drive. Check your connection and sign-in.' });
@@ -1716,7 +1991,10 @@ export default function FlashcardDrillApp() {
     // back button, so all three behave the same way.
     function flushPracticeBackupIfNeeded() {
         if (practiceDirtyRef.current && googleSignedIn) {
-            driveBackupNow(true);
+            // Practice is always scoped to one open deck (selectedDeckId) — see
+            // CONTEXT.md, Practice session mechanics — so only that deck's
+            // cards.json needs rewriting, however many cards changed this session.
+            driveBackupNow(true, { cards: true, deckId: selectedDeckId });
         }
         practiceDirtyRef.current = false;
     }
@@ -1949,7 +2227,7 @@ export default function FlashcardDrillApp() {
         };
         const nextDecks = [...decks, deck];
         persistDecks(nextDecks);
-        triggerAutoBackup(nextDecks, undefined);
+        triggerAutoBackup({ decks: true }, nextDecks);
         setSelectedDeckId(deck.id);
         setNewDeckName('');
         setNewDeckCategory('');
@@ -1969,7 +2247,7 @@ export default function FlashcardDrillApp() {
             ? [...cards.filter((c) => c.deckId !== selectedDeckId), ...withMeta]
             : [...cards, ...withMeta];
         persistCards(next);
-        triggerAutoBackup(undefined, next);
+        triggerAutoBackup({ cards: true, deckId: selectedDeckId }, undefined, next);
         setImportText('');
         setParsedPreview(null);
         setView('deck');
@@ -2031,7 +2309,7 @@ export default function FlashcardDrillApp() {
         const match = (d) => (isUncategorized ? !d.category || !d.category.trim() : d.category === categoryKey);
         const nextDecks = decks.map((d) => (match(d) ? { ...d, category: name } : d));
         persistDecks(nextDecks);
-        triggerAutoBackup(nextDecks, undefined);
+        triggerAutoBackup({ decks: true }, nextDecks);
     }
     function renameDeck(deckId, newName) {
         const name = newName.trim();
@@ -2039,7 +2317,7 @@ export default function FlashcardDrillApp() {
             return;
         const nextDecks = decks.map((d) => (d.id === deckId ? { ...d, name } : d));
         persistDecks(nextDecks);
-        triggerAutoBackup(nextDecks, undefined);
+        triggerAutoBackup({ decks: true }, nextDecks);
     }
     // updateDeckThinkTime: the brain icon in Edit Zone's deck list — sets extra
     // thinking seconds added to that deck's Strong/Good cutoffs (for decks that
@@ -2063,7 +2341,7 @@ export default function FlashcardDrillApp() {
     function updateDeckPracticeOrder(deckId, order) {
         const nextDecks = decks.map((d) => (d.id === deckId ? { ...d, practiceOrder: order } : d));
         persistDecks(nextDecks);
-        triggerAutoBackup(nextDecks, undefined);
+        triggerAutoBackup({ decks: true }, nextDecks);
     }
     // updateCategoryThinkTime: the brain icon in Edit Zone's category list —
     // same idea as updateDeckThinkTime, but applies the offset to EVERY deck in
@@ -2106,11 +2384,12 @@ export default function FlashcardDrillApp() {
             return;
         }
         const p = parsed[0];
+        const editedDeckId = (cards.find((c) => c.id === editingCardId) || {}).deckId;
         const nextCards = cards.map((c) => c.id === editingCardId
             ? { ...c, question: p.question, correctAnswer: p.correctAnswer, distractors: p.distractors, hint: p.hint, solution: p.solution, difficulty: 'good', updatedAt: Date.now() }
             : c);
         persistCards(nextCards);
-        triggerAutoBackup(undefined, nextCards);
+        triggerAutoBackup({ cards: true, deckId: editedDeckId }, undefined, nextCards);
         setEditingCardId(null);
         setEditingCardDraft('');
         setEditingCardError('');
@@ -2190,7 +2469,7 @@ export default function FlashcardDrillApp() {
         };
         const nextNotes = [...notes, note];
         persistNotes(nextNotes);
-        triggerAutoBackup(undefined, undefined, nextNotes);
+        triggerAutoBackup({ notes: true, deckId }, undefined, undefined, nextNotes);
         setNoteImportTitle('');
         setNoteImportBody('');
         setNoteImportContentType('markdown');
@@ -2199,9 +2478,10 @@ export default function FlashcardDrillApp() {
     // discrete action (no session/cycle concept like MCQ practice), so it backs
     // up immediately, same as a card edit would.
     function rateNote(noteId, rating) {
+        const ratedDeckId = (notes.find((n) => n.id === noteId) || {}).deckId;
         const nextNotes = notes.map((n) => (n.id === noteId ? { ...n, sr: scheduleNoteLevel(n.sr, rating), updatedAt: Date.now() } : n));
         persistNotes(nextNotes);
-        triggerAutoBackup(undefined, undefined, nextNotes);
+        triggerAutoBackup({ notes: true, deckId: ratedDeckId }, undefined, undefined, nextNotes);
     }
     function beginEditNote(note) {
         setEditingNoteId(note.id);
@@ -2221,9 +2501,10 @@ export default function FlashcardDrillApp() {
         const title = editingNoteTitleDraft.trim();
         if (!title || !editingNoteBodyDraft.trim())
             return;
+        const editedNoteDeckId = (notes.find((n) => n.id === editingNoteId) || {}).deckId;
         const nextNotes = notes.map((n) => n.id === editingNoteId ? { ...n, title, body: editingNoteBodyDraft, modifiedAt: Date.now(), updatedAt: Date.now() } : n);
         persistNotes(nextNotes);
-        triggerAutoBackup(undefined, undefined, nextNotes);
+        triggerAutoBackup({ notes: true, deckId: editedNoteDeckId }, undefined, undefined, nextNotes);
         setEditingNoteId(null);
         setEditingNoteTitleDraft('');
         setEditingNoteBodyDraft('');
@@ -3065,7 +3346,7 @@ export default function FlashcardDrillApp() {
                             React.createElement(LogOut, { size: 13 }),
                             " Sign out")),
                     React.createElement("div", { className: "flex gap-2" },
-                        React.createElement("button", { onClick: () => driveBackupNow(false), disabled: driveBusy, style: { backgroundColor: COLORS.accent, ...fontStyle }, className: "flex-1 rounded-lg text-white text-sm font-bold py-2.5 flex items-center justify-center gap-2 disabled:opacity-50" },
+                        React.createElement("button", { onClick: () => driveBackupNow(false, { full: true }), disabled: driveBusy, style: { backgroundColor: COLORS.accent, ...fontStyle }, className: "flex-1 rounded-lg text-white text-sm font-bold py-2.5 flex items-center justify-center gap-2 disabled:opacity-50" },
                             React.createElement(RefreshCw, { size: 16 }),
                             " ",
                             driveBusy ? 'Working…' : 'Back Up Now'),
