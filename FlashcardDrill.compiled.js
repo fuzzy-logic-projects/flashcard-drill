@@ -435,13 +435,56 @@ function buildBackupPayload(decks, cards, notes, settings) {
     };
 }
 // Deck identity = category + name together (not name alone). Same category+name on
-// both sides => same deck, cards merge (Drive wins on duplicate questions). Same name
-// but different category => two separate decks, both preserved independently.
+// both sides => same deck, cards/notes merge with whichever side was touched more
+// recently winning on any question/title that exists on both sides. Same name but
+// different category => two separate decks, both preserved independently.
 // deckKey / mergeBackups: used when signing in with existing local decks —
 // decides which decks/cards count as "the same" (category + name) vs. which
 // stay separate. See the Keep & Merge behavior in Backup & Restore.
 function deckKey(d) {
     return `${(d.category || '').trim().toLowerCase()}|||${(d.name || '').trim().toLowerCase()}`;
+}
+// lastTouched: the timestamp used to pick a winner when the same card/note exists
+// on both sides of a merge. updatedAt is bumped on every real change to a card
+// (level/difficulty change, content edit) or note (rating, content edit); modifiedAt
+// is the older notes-only field, kept as a fallback. createdAt is the last resort for
+// records saved before updatedAt existed.
+function lastTouched(entity) {
+    return entity.updatedAt || entity.modifiedAt || entity.createdAt || 0;
+}
+// mergeByRecency: matches two lists of records (cards or notes) belonging to the
+// same deck by a normalized identity (question text / title) and keeps whichever
+// side's record was touched more recently — NOT "Drive always wins" like before.
+// Records that exist on only one side pass through untouched. retagDeckId re-stamps
+// any record sourced from `localList` onto the canonical (Drive) deck id.
+function mergeByRecency(localList, driveList, identityFn, retagDeckId) {
+    const localByIdentity = new Map();
+    localList.forEach((r) => {
+        const key = identityFn(r);
+        if (!localByIdentity.has(key))
+            localByIdentity.set(key, r);
+    });
+    const usedLocalKeys = new Set();
+    const out = [];
+    driveList.forEach((dr) => {
+        const key = identityFn(dr);
+        const lr = localByIdentity.get(key);
+        if (lr) {
+            usedLocalKeys.add(key);
+            out.push(lastTouched(lr) > lastTouched(dr) ? (retagDeckId ? { ...lr, deckId: retagDeckId } : lr) : dr);
+        }
+        else {
+            out.push(dr);
+        }
+    });
+    localList.forEach((lr) => {
+        const key = identityFn(lr);
+        if (!usedLocalKeys.has(key)) {
+            usedLocalKeys.add(key);
+            out.push(retagDeckId ? { ...lr, deckId: retagDeckId } : lr);
+        }
+    });
+    return out;
 }
 function mergeBackups(localDecks, localCards, localNotes, driveDecks, driveCards, driveNotes) {
     const driveByKey = new Map(driveDecks.map((d) => [deckKey(d), d]));
@@ -452,22 +495,19 @@ function mergeBackups(localDecks, localCards, localNotes, driveDecks, driveCards
     for (const ld of localDecks) {
         const dd = driveByKey.get(deckKey(ld));
         if (dd) {
-            // Same category + name — same deck. Drive's deck record is kept as canonical;
-            // cards merge with Drive winning on duplicate questions.
+            // Same category + name — same deck. Drive's deck record is kept as canonical
+            // (deck metadata itself isn't versioned); cards/notes merge with whichever
+            // side was touched more recently winning on duplicates.
             usedDriveDeckIds.add(dd.id);
             resultDecks.push(dd);
             const driveDeckCards = driveCards.filter((c) => c.deckId === dd.id);
-            const driveQSet = new Set(driveDeckCards.map((c) => (c.question || '').trim().toLowerCase()));
-            driveDeckCards.forEach((c) => resultCards.push(c));
-            localCards
-                .filter((c) => c.deckId === ld.id && !driveQSet.has((c.question || '').trim().toLowerCase()))
-                .forEach((c) => resultCards.push({ ...c, deckId: dd.id }));
+            const localDeckCards = localCards.filter((c) => c.deckId === ld.id);
+            mergeByRecency(localDeckCards, driveDeckCards, (c) => (c.question || '').trim().toLowerCase(), dd.id)
+                .forEach((c) => resultCards.push(c));
             const driveDeckNotes = (driveNotes || []).filter((n) => n.deckId === dd.id);
-            const driveTitleSet = new Set(driveDeckNotes.map((n) => (n.title || '').trim().toLowerCase()));
-            driveDeckNotes.forEach((n) => resultNotes.push(n));
-            (localNotes || [])
-                .filter((n) => n.deckId === ld.id && !driveTitleSet.has((n.title || '').trim().toLowerCase()))
-                .forEach((n) => resultNotes.push({ ...n, deckId: dd.id }));
+            const localDeckNotes = (localNotes || []).filter((n) => n.deckId === ld.id);
+            mergeByRecency(localDeckNotes, driveDeckNotes, (n) => (n.title || '').trim().toLowerCase(), dd.id)
+                .forEach((n) => resultNotes.push(n));
         }
         else {
             // No match by category+name — local-only deck, kept as-is (even if the name
@@ -1181,11 +1221,16 @@ export default function FlashcardDrillApp() {
         }
     }
     // Runs right after a successful sign-in. If there's no local data, restore Drive's
-    // backup automatically. If local decks already exist, ask before touching anything.
+    // backup automatically. If local decks already exist, merge automatically unless
+    // there's a genuine two-way conflict (a deck only local has AND a deck only Drive
+    // has), in which case ask before touching anything.
     // ===== FUNCTION: RESTORE ON SIGN-IN (search: FUNCTION: RESTORE ON SIGN-IN) =====
-    // syncAfterSignIn: runs right after a successful sign-in. Auto-restores
-    // from Drive if there are no local decks yet; otherwise asks Keep & Merge
-    // vs. Rewrite (see applySignInRewrite / applySignInMerge below).
+    // syncAfterSignIn: runs right after a successful sign-in. Auto-restores from
+    // Drive if there are no local decks yet. Otherwise auto-merges (recency wins
+    // on duplicate cards/notes, see mergeByRecency) whenever at most one side has
+    // decks the other lacks; only asks Keep & Merge vs. Rewrite (see
+    // applySignInRewrite / applySignInMerge below) when both sides have decks the
+    // other doesn't.
     async function syncAfterSignIn(token) {
         try {
             const fileId = await driveFindBackupFileId(token);
@@ -1209,11 +1254,33 @@ export default function FlashcardDrillApp() {
                 setTimeout(() => {
                     setDriveNotice((prev) => (prev && prev.text === 'Restored your decks from Google Drive.' ? null : prev));
                 }, 5000);
+                return;
             }
-            else {
+            const driveDecks = Array.isArray(parsed.decks) ? parsed.decks : [];
+            const driveCards = Array.isArray(parsed.cards) ? parsed.cards : [];
+            const driveNotesIn = Array.isArray(parsed.notes) ? parsed.notes : [];
+            // Only interrupt sign-in with a prompt when BOTH sides have a deck the
+            // other side lacks — that's the one case with no lossless default,
+            // since picking either side alone would silently drop a whole deck. If
+            // every deck matches 1:1 (identical deck sets), or only one side has
+            // extra decks, nothing is lost by merging automatically: matching decks
+            // resolve card/note conflicts by recency (see mergeByRecency), and any
+            // one-sided extra decks just get folded in and pushed back to Drive.
+            const driveKeySet = new Set(driveDecks.map(deckKey));
+            const localKeySet = new Set(decks.map(deckKey));
+            const hasLocalOnlyDeck = decks.some((d) => !driveKeySet.has(deckKey(d)));
+            const hasDriveOnlyDeck = driveDecks.some((d) => !localKeySet.has(deckKey(d)));
+            if (hasLocalOnlyDeck && hasDriveOnlyDeck) {
                 setSignInSyncPrompt({ drivePayload: parsed });
                 setView('backup');
+                return;
             }
+            const merged = mergeBackups(decks, cards, notes, driveDecks, driveCards, driveNotesIn);
+            persistDecks(merged.decks);
+            persistCards(merged.cards);
+            persistNotes(merged.notes);
+            setDriveNotice({ tone: 'success', text: 'Synced with Google Drive.' });
+            driveBackupNow(true, merged.decks, merged.cards, merged.notes);
         }
         catch (e) {
             // Sign-in itself still succeeded even if this sync step failed silently.
@@ -1730,6 +1797,7 @@ export default function FlashcardDrillApp() {
                         }
                         if (outcome)
                             next.difficulty = outcome;
+                        next.updatedAt = Date.now();
                         return next;
                     });
                     persistCards(updated);
@@ -1781,7 +1849,7 @@ export default function FlashcardDrillApp() {
                 // as the missedSet/sessionEverMissed bookkeeping above.
                 if (sessionAffectsProgress && isFirstMiss) {
                     const updated = cardsRef.current.map((c) => c.id === id
-                        ? { ...c, sr: scheduleNextLevel(c.sr, 'incorrect'), difficulty: 'incorrect' }
+                        ? { ...c, sr: scheduleNextLevel(c.sr, 'incorrect'), difficulty: 'incorrect', updatedAt: Date.now() }
                         : c);
                     persistCards(updated);
                 }
@@ -1818,7 +1886,7 @@ export default function FlashcardDrillApp() {
     function commitImport() {
         if (!parsedPreview || parsedPreview.cards.length === 0 || !selectedDeckId)
             return;
-        const withMeta = parsedPreview.cards.map((c) => ({ ...c, deckId: selectedDeckId, sr: defaultSr(), difficulty: 'good' }));
+        const withMeta = parsedPreview.cards.map((c) => ({ ...c, deckId: selectedDeckId, sr: defaultSr(), difficulty: 'good', updatedAt: Date.now() }));
         const next = importMode === 'replace'
             ? [...cards.filter((c) => c.deckId !== selectedDeckId), ...withMeta]
             : [...cards, ...withMeta];
@@ -1905,7 +1973,7 @@ export default function FlashcardDrillApp() {
     function updateDeckThinkTime(deckId, strongOffsetSec, goodOffsetSec) {
         const clamp = (n) => Math.max(0, Math.min(1200, Number.isFinite(n) ? n : 0));
         const nextDecks = decks.map((d) => d.id === deckId ? { ...d, strongOffsetSec: clamp(strongOffsetSec), goodOffsetSec: clamp(goodOffsetSec) } : d);
-        const nextCards = cards.map((c) => (c.deckId === deckId ? { ...c, sr: defaultSr(), difficulty: 'good' } : c));
+        const nextCards = cards.map((c) => (c.deckId === deckId ? { ...c, sr: defaultSr(), difficulty: 'good', updatedAt: Date.now() } : c));
         persistDecks(nextDecks);
         persistCards(nextCards);
         setEditZoneNotice(googleSignedIn ? 'Think time updated and deck progress reset. Back up manually to save this on Drive.' : 'Think time updated and deck progress reset.');
@@ -1929,7 +1997,7 @@ export default function FlashcardDrillApp() {
         const inCategory = (d) => (isUncategorized ? !d.category || !d.category.trim() : d.category === categoryKey);
         const affectedDeckIds = new Set(decks.filter(inCategory).map((d) => d.id));
         const nextDecks = decks.map((d) => affectedDeckIds.has(d.id) ? { ...d, strongOffsetSec: clamp(strongOffsetSec), goodOffsetSec: clamp(goodOffsetSec) } : d);
-        const nextCards = cards.map((c) => (affectedDeckIds.has(c.deckId) ? { ...c, sr: defaultSr(), difficulty: 'good' } : c));
+        const nextCards = cards.map((c) => (affectedDeckIds.has(c.deckId) ? { ...c, sr: defaultSr(), difficulty: 'good', updatedAt: Date.now() } : c));
         persistDecks(nextDecks);
         persistCards(nextCards);
         setEditZoneNotice(googleSignedIn
@@ -1961,7 +2029,7 @@ export default function FlashcardDrillApp() {
         }
         const p = parsed[0];
         const nextCards = cards.map((c) => c.id === editingCardId
-            ? { ...c, question: p.question, correctAnswer: p.correctAnswer, distractors: p.distractors, hint: p.hint, solution: p.solution, difficulty: 'good' }
+            ? { ...c, question: p.question, correctAnswer: p.correctAnswer, distractors: p.distractors, hint: p.hint, solution: p.solution, difficulty: 'good', updatedAt: Date.now() }
             : c);
         persistCards(nextCards);
         triggerAutoBackup(undefined, nextCards);
@@ -2040,6 +2108,7 @@ export default function FlashcardDrillApp() {
             sr: defaultSr(),
             createdAt: now,
             modifiedAt: now,
+            updatedAt: now,
         };
         const nextNotes = [...notes, note];
         persistNotes(nextNotes);
@@ -2052,7 +2121,7 @@ export default function FlashcardDrillApp() {
     // discrete action (no session/cycle concept like MCQ practice), so it backs
     // up immediately, same as a card edit would.
     function rateNote(noteId, rating) {
-        const nextNotes = notes.map((n) => (n.id === noteId ? { ...n, sr: scheduleNoteLevel(n.sr, rating) } : n));
+        const nextNotes = notes.map((n) => (n.id === noteId ? { ...n, sr: scheduleNoteLevel(n.sr, rating), updatedAt: Date.now() } : n));
         persistNotes(nextNotes);
         triggerAutoBackup(undefined, undefined, nextNotes);
     }
@@ -2074,7 +2143,7 @@ export default function FlashcardDrillApp() {
         const title = editingNoteTitleDraft.trim();
         if (!title || !editingNoteBodyDraft.trim())
             return;
-        const nextNotes = notes.map((n) => n.id === editingNoteId ? { ...n, title, body: editingNoteBodyDraft, modifiedAt: Date.now() } : n);
+        const nextNotes = notes.map((n) => n.id === editingNoteId ? { ...n, title, body: editingNoteBodyDraft, modifiedAt: Date.now(), updatedAt: Date.now() } : n);
         persistNotes(nextNotes);
         triggerAutoBackup(undefined, undefined, nextNotes);
         setEditingNoteId(null);
