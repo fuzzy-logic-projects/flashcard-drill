@@ -629,12 +629,15 @@ export default function FlashcardDrillApp() {
     const [pendingRestore, setPendingRestore] = useState(null); // { source: 'file'|'drive', payload }
     const [signInSyncPrompt, setSignInSyncPrompt] = useState(null); // { drivePayload } — shown only when local decks already exist at sign-in
     const tokenClientRef = useRef(null);
-    // pendingSilentSignInRef: the in-flight Promise from attemptSilentSignIn,
-    // while one is running (mount check, 45-min refresh, or online-reconnect).
-    // requestDriveToken awaits this before issuing an explicit request on the
-    // same shared token client — see FUNCTION: STAY SIGNED IN and CONTEXT.md,
-    // "double sign-in" fix 2026-07-23.
-    const pendingSilentSignInRef = useRef(null);
+    // pendingTokenRequestRef: the in-flight Promise for whichever request — silent
+    // or explicit — currently owns the shared token client. initTokenClient()
+    // exposes exactly one mutable .callback slot, so only one requestAccessToken()
+    // can safely be outstanding at a time; the mutex lives inside requestDriveToken
+    // itself so it guards BOTH directions (an explicit tap arriving mid-silent-check,
+    // and a silent check — mount, 45-min refresh, online-reconnect — arriving while
+    // an explicit tap is already in flight). See FUNCTION: STAY SIGNED IN and
+    // CONTEXT.md, "double sign-in" fix 2026-07-23 / 2026-07-23b.
+    const pendingTokenRequestRef = useRef(null);
     const restoreFileInputRef = useRef(null);
     const silentSignInAttemptedRef = useRef(false);
     const skipNextHistoryPushRef = useRef(false); // true while applying a popstate — avoids re-pushing the entry we just popped
@@ -960,45 +963,74 @@ export default function FlashcardDrillApp() {
                 reject(new Error('not-configured'));
                 return;
             }
-            // If a background silent check is still running (mount, 45-min
-            // refresh, or online-reconnect), wait for it to settle before
-            // touching the shared token client. Firing a second
-            // requestAccessToken() while one is already in flight overwrites
-            // the client's single callback slot, and Google ends up running
-            // the OAuth flow twice — the account picker/consent screen
-            // showing twice in a row. See CONTEXT.md, "double sign-in" fix
-            // 2026-07-23.
-            if (!opts.silent && pendingSilentSignInRef.current) {
-                const silentToken = await pendingSilentSignInRef.current;
-                if (silentToken) {
-                    resolve(silentToken);
-                    return;
+            // Whichever call — silent or explicit — reaches here first claims the
+            // shared token client below and every other call, of either kind,
+            // waits for it and reuses its result instead of touching the client
+            // itself. This has to be symmetric: the original version only made
+            // explicit calls wait on a silent one, so a silent check that started
+            // SECOND (mount racing a fast manual tap, or the 45-min refresh /
+            // online-reconnect firing mid-tap) could still fire its own
+            // requestAccessToken() and clobber the explicit call's .callback —
+            // Google then re-runs the OAuth flow, showing the account
+            // picker/consent screen a second time even though the user already
+            // completed it once. See CONTEXT.md, "double sign-in" fix 2026-07-23b.
+            if (pendingTokenRequestRef.current) {
+                try {
+                    const existingToken = await pendingTokenRequestRef.current;
+                    if (existingToken) {
+                        resolve(existingToken);
+                        return;
+                    }
+                    // in-flight request resolved with nothing (declined/failed) —
+                    // fall through so this call still gets its own real attempt.
+                }
+                catch (e) {
+                    // same — an errored in-flight request doesn't cost this call its shot.
                 }
             }
-            try {
+            const attempt = (async () => {
                 const client = await ensureTokenClient();
-                client.callback = (resp) => {
-                    if (resp && resp.access_token) {
-                        const expiresInSec = Number(resp.expires_in) || 3600;
-                        persistDriveTokenCache(resp.access_token, Date.now() + expiresInSec * 1000);
-                        resolve(resp.access_token);
-                    }
-                    else
-                        reject(new Error((resp && resp.error) || 'no-token'));
-                };
-                // Gate on googleEmail (persisted proof this account already granted
-                // consent before), not googleSignedIn (just in-memory, false after any
-                // failed/skipped silent attempt) — otherwise every manual fallback tap
-                // post-silent-failure forces Google's full consent screen again instead
-                // of the lighter account-chooser-only flow it's entitled to.
-                const overrideConfig = { prompt: opts.silent ? 'none' : googleEmail ? '' : 'consent' };
-                if (opts.hint)
-                    overrideConfig.login_hint = opts.hint;
-                client.requestAccessToken(overrideConfig);
-            }
-            catch (e) {
-                reject(e);
-            }
+                return await new Promise((res, rej) => {
+                    client.callback = (resp) => {
+                        if (resp && resp.access_token) {
+                            const expiresInSec = Number(resp.expires_in) || 3600;
+                            persistDriveTokenCache(resp.access_token, Date.now() + expiresInSec * 1000);
+                            res(resp.access_token);
+                        }
+                        else
+                            rej(new Error((resp && resp.error) || 'no-token'));
+                    };
+                    // Gate on googleEmail (persisted proof this account already granted
+                    // consent before), not googleSignedIn (just in-memory, false after any
+                    // failed/skipped silent attempt) — otherwise every manual fallback tap
+                    // post-silent-failure forces Google's full consent screen again instead
+                    // of the lighter account-chooser-only flow it's entitled to.
+                    const overrideConfig = { prompt: opts.silent ? 'none' : googleEmail ? '' : 'consent' };
+                    if (opts.hint)
+                        overrideConfig.login_hint = opts.hint;
+                    client.requestAccessToken(overrideConfig);
+                });
+            })();
+            // Published synchronously (no await above it in this branch) so a
+            // second call arriving in the very same tick still sees it.
+            pendingTokenRequestRef.current = attempt.catch(() => null);
+            // Confirmed 2026-07-22: after a long-enough closure, Google can drop a
+            // prompt:'none' request entirely — no callback, ever, so `attempt`
+            // would otherwise hang forever and permanently wedge the mutex above,
+            // blocking a real explicit tap behind a silent check that's never
+            // coming back. Only the silent path gets timed out — an explicit call
+            // has the user actively looking at Google's own UI, so there's really
+            // something to wait for there.
+            const settled = opts.silent
+                ? Promise.race([attempt, new Promise((_, rej) => setTimeout(() => rej(new Error('silent-timeout')), 8000))])
+                : attempt;
+            settled.then((token) => {
+                pendingTokenRequestRef.current = null;
+                resolve(token);
+            }, (err) => {
+                pendingTokenRequestRef.current = null;
+                reject(err);
+            });
         });
     }
     // persistDriveTokenCache: local-only cache of the current Drive access token and
@@ -1172,32 +1204,23 @@ export default function FlashcardDrillApp() {
         // touching driveSignedOutByUser's job. Fix 2026-07-23, see CONTEXT.md.
         if (!driveConfigured() || driveSignedOutByUser || !hasSignedInBefore)
             return null;
-        // Reuse an already-in-flight attempt (e.g. mount + online-reconnect firing
-        // close together) instead of starting a second one, and publish this one in
-        // pendingSilentSignInRef so requestDriveToken can wait on it rather than
-        // racing it with an overlapping requestAccessToken() call.
-        if (pendingSilentSignInRef.current)
-            return pendingSilentSignInRef.current;
-        const promise = (async () => {
-            try {
-                const token = await requestDriveToken({ silent: true, hint: googleEmail });
-                setDriveAccessToken(token);
-                setGoogleSignedIn(true);
-                await captureGoogleEmailIfMissing(token);
-                return token;
-            }
-            catch (e) {
-                // Expected whenever there's no active Google session in this browser, or
-                // whenever Google's own silent-reauth check declines without erroring —
-                // just leave the "Continue with Google" button showing.
-                return null;
-            }
-            finally {
-                pendingSilentSignInRef.current = null;
-            }
-        })();
-        pendingSilentSignInRef.current = promise;
-        return promise;
+        // requestDriveToken itself dedupes concurrent calls now (pendingTokenRequestRef
+        // covers silent AND explicit callers) — a second attemptSilentSignIn firing
+        // close behind this one (mount + online-reconnect, say) just reuses that
+        // in-flight result instead of racing it, so no separate ref is needed here.
+        try {
+            const token = await requestDriveToken({ silent: true, hint: googleEmail });
+            setDriveAccessToken(token);
+            setGoogleSignedIn(true);
+            await captureGoogleEmailIfMissing(token);
+            return token;
+        }
+        catch (e) {
+            // Expected whenever there's no active Google session in this browser, or
+            // whenever Google's own silent-reauth check declines without erroring —
+            // just leave the "Continue with Google" button showing.
+            return null;
+        }
     }
     async function driveFindBackupFileId(token) {
         const q = encodeURIComponent(`name='${DRIVE_BACKUP_FILENAME}'`);
@@ -3826,12 +3849,48 @@ function SessionSummaryScreen({ colors: COLORS, cards, sessionPoolIds, sessionRe
             setChromeInsetPx(Math.max(0, window.innerHeight - vv.height - vv.offsetTop));
         };
         updateInset();
+        // Re-measure a couple of frames later too — right at mount the browser's
+        // own chrome (address bar collapsing/expanding after the practice→summary
+        // transition) can still be mid-animation, so the very first reading can be
+        // stale. Cheap and a no-op if nothing's actually changed.
+        const raf1 = requestAnimationFrame(() => {
+            updateInset();
+            requestAnimationFrame(updateInset);
+        });
         vv.addEventListener('resize', updateInset);
         vv.addEventListener('scroll', updateInset);
         return () => {
+            cancelAnimationFrame(raf1);
             vv.removeEventListener('resize', updateInset);
             vv.removeEventListener('scroll', updateInset);
         };
+    }, []);
+    // Land at the top regardless of how far the practice screen had been
+    // scrolled — otherwise the tile row's natural (non-stuck) position can
+    // already be above the fold on first paint, which is one more way some
+    // mobile browsers fail to recognize it as stuck until a later scroll event.
+    useEffect(() => {
+        window.scrollTo(0, 0);
+    }, []);
+    // stickyRef + the effect below: some mobile browsers/WebViews only
+    // establish position:sticky's pinned behavior on the reflow AFTER the one
+    // that first inserts the element — on the very first paint it behaves like
+    // a normal block and scrolls away. Any later, unrelated style/layout
+    // mutation (e.g. tapping a tile, which changes its border/background)
+    // forces that reflow as a side effect, which is why it "starts working"
+    // only after interacting with it. Reading layout geometry inside a double
+    // rAF forces the same reflow deterministically, right on mount.
+    const stickyRef = useRef(null);
+    useEffect(() => {
+        const el = stickyRef.current;
+        if (!el)
+            return;
+        requestAnimationFrame(() => {
+            void el.getBoundingClientRect();
+            requestAnimationFrame(() => {
+                void el.getBoundingClientRect();
+            });
+        });
     }, []);
     const lastScrollYRef = useRef(0);
     useEffect(() => {
@@ -3911,16 +3970,17 @@ function SessionSummaryScreen({ colors: COLORS, cards, sessionPoolIds, sessionRe
                 React.createElement(Check, { size: 18, style: { color: COLORS.green } }),
                 React.createElement("div", { style: { fontFamily: "'Roboto Slab', serif", color: COLORS.green }, className: "text-xl font-bold tracking-wide" }, "ALL CLEAR"),
                 React.createElement("div", { style: { fontFamily: "'Space Mono', monospace", color: COLORS.green }, className: "text-xs mt-1" }, `${items.length} card${items.length !== 1 ? 's' : ''}${sessionAffectsProgress ? ' \u00B7 next reviews rescheduled' : ''}`))),
-        React.createElement("div", { className: "sticky top-0 z-10 grid grid-cols-2 gap-2 py-2", style: { backgroundColor: COLORS.paper } }, tiers.map((t) => {
-            const active = filterTier === t.key;
-            const dimmed = !!filterTier && !active;
-            const tierPct = items.length ? Math.round((counts[t.key] / items.length) * 100) : 0;
-            return (React.createElement("button", { key: t.key, onClick: () => setFilterTier((prev) => (prev === t.key ? null : t.key)), className: "rounded-xl border-2 px-3 py-2 flex flex-col gap-1.5 transition-all duration-200", style: { borderColor: t.color, backgroundColor: t.bg, opacity: dimmed ? 0.4 : 1, boxShadow: active ? `0 0 0 2px ${t.color}` : 'none' } },
-                React.createElement("div", { className: "flex items-center justify-between" },
-                    React.createElement("span", { style: { fontFamily: "'Roboto Slab', serif", color: t.color }, className: "text-xs font-bold" }, t.label),
-                    React.createElement("span", { style: { fontFamily: "'Space Mono', monospace", color: t.color }, className: "text-sm font-bold" }, counts[t.key])),
-                React.createElement("div", { className: "h-1 rounded-full overflow-hidden", style: { backgroundColor: COLORS.rule } }, React.createElement("div", { className: "h-full rounded-full transition-all duration-300", style: { width: `${tierPct}%`, backgroundColor: t.color } }))));
-        })),
+        React.createElement("div", { ref: stickyRef, className: "sticky top-0 z-10 py-2", style: { backgroundColor: COLORS.paper, transform: 'translateZ(0)', WebkitTransform: 'translateZ(0)', willChange: 'transform' } },
+            React.createElement("div", { className: "grid grid-cols-2 gap-2" }, tiers.map((t) => {
+                const active = filterTier === t.key;
+                const dimmed = !!filterTier && !active;
+                const tierPct = items.length ? Math.round((counts[t.key] / items.length) * 100) : 0;
+                return (React.createElement("button", { key: t.key, onClick: () => setFilterTier((prev) => (prev === t.key ? null : t.key)), className: "rounded-xl border-2 px-3 py-2 flex flex-col gap-1.5 transition-all duration-200", style: { borderColor: t.color, backgroundColor: t.bg, opacity: dimmed ? 0.4 : 1, boxShadow: active ? `0 0 0 2px ${t.color}` : 'none' } },
+                    React.createElement("div", { className: "flex items-center justify-between" },
+                        React.createElement("span", { style: { fontFamily: "'Roboto Slab', serif", color: t.color }, className: "text-xs font-bold" }, t.label),
+                        React.createElement("span", { style: { fontFamily: "'Space Mono', monospace", color: t.color }, className: "text-sm font-bold" }, counts[t.key])),
+                    React.createElement("div", { className: "h-1 rounded-full overflow-hidden", style: { backgroundColor: COLORS.rule } }, React.createElement("div", { className: "h-full rounded-full transition-all duration-300", style: { width: `${tierPct}%`, backgroundColor: t.color } }))));
+            }))),
         React.createElement("div", { style: { fontFamily: "'Space Mono', monospace", color: COLORS.inkFaint }, className: "text-xs uppercase tracking-widest" }, filterTier ? `Time per card \u00B7 ${tiers.find((t) => t.key === filterTier).label}` : "Time per card"),
         React.createElement("div", { className: "flex flex-col gap-2" }, visibleItems.map((it) => {
             const tier = tiers.find((t) => t.key === it.outcome) || tiers[1];
