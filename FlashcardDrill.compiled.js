@@ -96,6 +96,15 @@ const FONT_SIZE_KEY = 'flashdrill:v2:fontSize';
 const DARK_MODE_KEY = 'flashdrill:v2:darkMode';
 const BACKUP_META_KEY = 'flashdrill:v2:backupMeta';
 const DRIVE_TOKEN_CACHE_KEY = 'flashdrill:v2:driveTokenCache';
+// SILENT_REAUTH_SKIP_AFTER_MS: if the cached Drive token has been expired longer than
+// this, skip the automatic no-popup reauth attempt on load/reconnect entirely instead
+// of firing it and letting it fail. A token merely a few minutes past expiry (tab left
+// open past the 45-min background refresh) is still worth a quick silent try. A token
+// expired by more than this is the signature of an actual browser/tab closure — and
+// prompt:'none' is confirmed (see FUNCTION: STAY SIGNED IN) to hang with no callback
+// ever firing in that case, while still visibly flashing Google's own "One moment
+// please" card first. Skipping it there just shows "Continue with Google" directly.
+const SILENT_REAUTH_SKIP_AFTER_MS = 10 * 60 * 1000;
 // ---- Google Drive backup config -------------------------------------------------
 // Replace with your own OAuth Web Client ID from Google Cloud Console before this
 // will work. It will NOT authenticate inside the Claude preview — it needs to be
@@ -640,6 +649,8 @@ export default function FlashcardDrillApp() {
     const [driveNotice, setDriveNotice] = useState(null); // { tone: 'error'|'success'|'info', text }
     const [pendingRestore, setPendingRestore] = useState(null); // { source: 'file'|'drive', payload }
     const [signInSyncPrompt, setSignInSyncPrompt] = useState(null); // { drivePayload } — shown only when local decks already exist at sign-in
+    const [confirmSignOut, setConfirmSignOut] = useState(false); // gates handleGoogleSignOut behind an "are you sure" step — shared by both entry points (Settings, Backup screen)
+    const [signOutBusy, setSignOutBusy] = useState(false); // spans the whole sign-out operation (last backup + revoke + local wipe), not just driveBackupNow's own driveBusy window
     const tokenClientRef = useRef(null);
     // pendingTokenRequestRef: the in-flight Promise for whichever request — silent
     // or explicit — currently owns the shared token client. initTokenClient()
@@ -1014,7 +1025,18 @@ export default function FlashcardDrillApp() {
             // completed it once. See CONTEXT.md, "double sign-in" fix 2026-07-23b.
             if (pendingTokenRequestRef.current) {
                 try {
-                    const existingToken = await pendingTokenRequestRef.current;
+                    // Race the join itself against a timeout — the *owning* call's own 8s
+                    // timeout below only bounds ITS return value; it does NOT cancel the
+                    // underlying client.requestAccessToken() call, which can be left
+                    // dangling forever if Google never invokes the callback (confirmed:
+                    // happens after a long browser closure — see FUNCTION: STAY SIGNED IN).
+                    // Without this, a joiner (e.g. sign-out's last-chance backup) would
+                    // await that same dangling promise directly and hang indefinitely
+                    // instead of falling through to its own attempt.
+                    const existingToken = await Promise.race([
+                        pendingTokenRequestRef.current,
+                        new Promise((_, rej) => setTimeout(() => rej(new Error('pending-request-timeout')), 8000)),
+                    ]);
                     if (existingToken) {
                         resolve(existingToken);
                         return;
@@ -1023,7 +1045,8 @@ export default function FlashcardDrillApp() {
                     // fall through so this call still gets its own real attempt.
                 }
                 catch (e) {
-                    // same — an errored in-flight request doesn't cost this call its shot.
+                    // same — an errored or still-hanging in-flight request doesn't cost
+                    // this call its shot.
                 }
             }
             const attempt = (async () => {
@@ -1123,47 +1146,66 @@ export default function FlashcardDrillApp() {
     // popup) so nothing created since the last backup is lost once local storage
     // is cleared below.
     async function handleGoogleSignOut() {
-        if (driveAccessToken) {
-            try {
-                await driveBackupNow(true, { full: true });
-            }
-            catch (e) { }
-        }
-        if (driveAccessToken && window.google && window.google.accounts && window.google.accounts.oauth2) {
-            try {
-                window.google.accounts.oauth2.revoke(driveAccessToken, () => { });
-            }
-            catch (e) { }
-        }
-        // Record the explicit sign-out before attempting the wipe below, so that even
-        // if the wipe only partly succeeds, attemptSilentSignIn still won't reuse the
-        // old session on the next load.
-        await persistBackupMeta({ driveSignedOutByUser: true });
-        // Wipe every key this app has written to localStorage (private scope only —
-        // window.storage is never called with shared:true elsewhere in this app).
+        setSignOutBusy(true);
         try {
-            const listed = await window.storage.list('', false);
-            const keys = (listed && listed.keys) || [];
-            await Promise.all(keys.map((k) => window.storage.delete(k, false).catch(() => { })));
+            if (driveAccessToken) {
+                try {
+                    // Best-effort only — sign-out must never hang waiting on Drive. Bounded
+                    // to 10s: driveBackupNow's own expired-token retry can still be waiting
+                    // out a stuck silent request it joined (bounded to 8s by the
+                    // requestDriveToken fix above), so give it a little more than that, then
+                    // move on regardless. See "Fixed 2026-07-24" in CONTEXT.md — this is what
+                    // used to make Log Out sometimes just sit on Google's "One moment please"
+                    // and never complete.
+                    await Promise.race([
+                        driveBackupNow(true, { full: true }),
+                        new Promise((resolve) => setTimeout(resolve, 10000)),
+                    ]);
+                }
+                catch (e) { }
+            }
+            if (driveAccessToken && window.google && window.google.accounts && window.google.accounts.oauth2) {
+                try {
+                    window.google.accounts.oauth2.revoke(driveAccessToken, () => { });
+                }
+                catch (e) { }
+            }
+            // Record the explicit sign-out before attempting the wipe below, so that even
+            // if the wipe only partly succeeds, attemptSilentSignIn still won't reuse the
+            // old session on the next load.
+            await persistBackupMeta({ driveSignedOutByUser: true });
+            // Wipe every key this app has written to localStorage (private scope only —
+            // window.storage is never called with shared:true elsewhere in this app).
+            try {
+                const listed = await window.storage.list('', false);
+                const keys = (listed && listed.keys) || [];
+                await Promise.all(keys.map((k) => window.storage.delete(k, false).catch(() => { })));
+            }
+            catch (e) { }
+            setDecks([]);
+            setCards([]);
+            setNotes([]);
+            setCycleSize(10);
+            setCycleSizeDraft('10');
+            setFontSizePx(18);
+            setDarkMode(false);
+            setDriveAccessToken(null);
+            setGoogleSignedIn(false);
+            setGoogleEmail(null);
+            setDriveSignedOutByUser(false);
+            setHasSignedInBefore(false);
+            setLastLocalBackupAt(null);
+            setLastDriveBackupAt(null);
+            setDriveNotice(null);
+            setSelectedDeckId(null);
+            setConfirmSignOut(false);
+            setView('home');
         }
-        catch (e) { }
-        setDecks([]);
-        setCards([]);
-        setNotes([]);
-        setCycleSize(10);
-        setCycleSizeDraft('10');
-        setFontSizePx(18);
-        setDarkMode(false);
-        setDriveAccessToken(null);
-        setGoogleSignedIn(false);
-        setGoogleEmail(null);
-        setDriveSignedOutByUser(false);
-        setHasSignedInBefore(false);
-        setLastLocalBackupAt(null);
-        setLastDriveBackupAt(null);
-        setDriveNotice(null);
-        setSelectedDeckId(null);
-        setView('home');
+        finally {
+            // Always clears, even if something above throws unexpectedly — the Log Out
+            // button must never get stuck showing "Logging out…" forever.
+            setSignOutBusy(false);
+        }
     }
     // tryReuseCachedDriveToken: on load, before ever asking Google for anything, check
     // whether we already have an access token saved from earlier that hasn't expired
@@ -1172,7 +1214,10 @@ export default function FlashcardDrillApp() {
     // moment please" screen from flashing on a normal reload: Google's silent
     // reauth (prompt:'none') still briefly opens a real window on mobile browsers to
     // check the session, so the only way to truly never show it is to not ask when
-    // we don't have to. Returns true if it reused a token, false otherwise.
+    // we don't have to. Returns { reused, expiredForMs }: reused is true if it reused
+    // a token; when false, expiredForMs tells the caller how stale the dead token is
+    // (null if there was none) so it can decide whether a silent retry is even worth
+    // attempting — see SILENT_REAUTH_SKIP_AFTER_MS.
     // captureGoogleEmailIfMissing: fetches and persists the account email if we
     // don't have it yet. Called opportunistically after EVERY successful token
     // acquisition (explicit sign-in, silent reauth, cached-token reuse) — not
@@ -1201,17 +1246,20 @@ export default function FlashcardDrillApp() {
         try {
             const res = await window.storage.get(DRIVE_TOKEN_CACHE_KEY, false);
             if (!res || !res.value)
-                return false;
+                return { reused: false, expiredForMs: null };
             const cached = JSON.parse(res.value);
-            if (cached && cached.token && cached.expiresAt && cached.expiresAt - 120000 > Date.now()) {
-                setDriveAccessToken(cached.token);
-                setGoogleSignedIn(true);
-                captureGoogleEmailIfMissing(cached.token);
-                return true;
+            if (cached && cached.token && cached.expiresAt) {
+                if (cached.expiresAt - 120000 > Date.now()) {
+                    setDriveAccessToken(cached.token);
+                    setGoogleSignedIn(true);
+                    captureGoogleEmailIfMissing(cached.token);
+                    return { reused: true, expiredForMs: 0 };
+                }
+                return { reused: false, expiredForMs: Date.now() - cached.expiresAt };
             }
         }
         catch (e) { }
-        return false;
+        return { reused: false, expiredForMs: null };
     }
     // Quietly re-authenticates using the last-used account, with no popup, so the
     // person doesn't have to click "Continue with Google" every time they open the
@@ -1381,8 +1429,13 @@ export default function FlashcardDrillApp() {
     // sets {notes:true, deckId}). overrideDecks/overrideCards/overrideNotes/
     // overrideSettings: freshly computed values to use instead of state, same
     // reasoning as before — so a just-computed value can be sent immediately
-    // without waiting on state to propagate first.
-    async function driveBackupNow(silent, scope, overrideDecks, overrideCards, overrideNotes, overrideSettings) {
+    // without waiting on state to propagate first. overrideToken: same idea but for
+    // the access token — required for any caller that runs synchronously right after
+    // its own setDriveAccessToken(token) call (e.g. syncAfterSignIn from within
+    // handleGoogleSignIn), since driveAccessToken state hasn't re-rendered yet at that
+    // point and would otherwise still read as the PRE-sign-in (often null) value —
+    // see "Fixed 2026-07-24" in CONTEXT.md.
+    async function driveBackupNow(silent, scope, overrideDecks, overrideCards, overrideNotes, overrideSettings, overrideToken) {
         if (!silent)
             setDriveNotice(null);
         setDriveBusy(true);
@@ -1422,7 +1475,7 @@ export default function FlashcardDrillApp() {
             await Promise.all(jobs);
         };
         try {
-            let token = driveAccessToken;
+            let token = overrideToken || driveAccessToken;
             if (!token)
                 token = await requestDriveToken();
             try {
@@ -1608,7 +1661,15 @@ export default function FlashcardDrillApp() {
             perDeck.forEach((p) => { nextDeckSync[p.deckId] = { cardsModifiedTime: p.cardsModifiedTime, notesModifiedTime: p.notesModifiedTime }; });
             persistBackupMeta({ deckSync: nextDeckSync });
             setDriveNotice({ tone: 'success', text: 'Synced with Google Drive.' });
-            driveBackupNow(true, { full: true }, merged.decks, merged.cards, merged.notes);
+            // Pass `token` explicitly (overrideToken) instead of letting driveBackupNow
+            // fall back to driveAccessToken state: this runs synchronously inside
+            // handleGoogleSignIn right after its setDriveAccessToken(token) call, before
+            // React has re-rendered — so that state var is still the PRE-sign-in value
+            // (null, or an old token) in this closure. Reading it made driveBackupNow
+            // think there was no token and fire a second, non-silent requestDriveToken()
+            // call, popping the account picker/consent screen again right after the user
+            // had just finished it. See "Fixed 2026-07-24" in CONTEXT.md.
+            driveBackupNow(true, { full: true }, merged.decks, merged.cards, merged.notes, undefined, token);
             cleanupOrphanedDeckFiles(token, filesByName, merged.decks);
         }
         catch (e) {
@@ -1642,7 +1703,7 @@ export default function FlashcardDrillApp() {
         persistNotes(merged.notes);
         setSignInSyncPrompt(null);
         setDriveNotice({ tone: 'success', text: 'Merged local decks with your Drive backup.' });
-        driveBackupNow(true, { full: true }, merged.decks, merged.cards, merged.notes);
+        driveBackupNow(true, { full: true }, merged.decks, merged.cards, merged.notes, undefined, driveAccessToken);
         if (driveAccessToken && filesByName)
             cleanupOrphanedDeckFiles(driveAccessToken, filesByName, merged.decks);
     }
@@ -1744,8 +1805,14 @@ export default function FlashcardDrillApp() {
             return;
         silentSignInAttemptedRef.current = true;
         (async () => {
-            const reused = await tryReuseCachedDriveToken();
-            if (!reused)
+            const { reused, expiredForMs } = await tryReuseCachedDriveToken();
+            // See SILENT_REAUTH_SKIP_AFTER_MS: a token expired long enough to look like
+            // an actual browser/tab closure is confirmed to make attemptSilentSignIn's
+            // prompt:'none' call hang with no callback ever firing, while still visibly
+            // flashing Google's own "One moment please" card first — so skip it and go
+            // straight to showing "Continue with Google". A token only briefly stale is
+            // still worth the quick silent try.
+            if (!reused && (expiredForMs === null || expiredForMs <= SILENT_REAUTH_SKIP_AFTER_MS))
                 attemptSilentSignIn();
         })();
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1775,8 +1842,8 @@ export default function FlashcardDrillApp() {
     useEffect(() => {
         function onOnline() {
             (async () => {
-                const reused = await tryReuseCachedDriveToken();
-                if (!reused)
+                const { reused, expiredForMs } = await tryReuseCachedDriveToken();
+                if (!reused && (expiredForMs === null || expiredForMs <= SILENT_REAUTH_SKIP_AFTER_MS))
                     attemptSilentSignIn();
             })();
         }
@@ -3222,7 +3289,7 @@ export default function FlashcardDrillApp() {
     }
     else if (view === 'settings') {
         content = (React.createElement("div", { className: "flex flex-col gap-4" },
-            React.createElement(BackHeader, { colors: COLORS, onBack: () => { setView('home'); setConfirmReset(false); }, title: "Settings" }),
+            React.createElement(BackHeader, { colors: COLORS, onBack: () => { setView('home'); setConfirmReset(false); setConfirmSignOut(false); }, title: "Settings" }),
             React.createElement("div", { className: "rounded-xl border-2 p-4", style: { borderColor: COLORS.rule, backgroundColor: COLORS.card } },
                 React.createElement("label", { style: { ...fontStyle, color: COLORS.ink }, className: "text-sm font-bold block mb-2" }, "Cards per cycle"),
                 React.createElement("div", { className: "flex gap-2" },
@@ -3281,9 +3348,13 @@ export default function FlashcardDrillApp() {
                     React.createElement("div", { className: "flex gap-2" },
                         React.createElement("button", { onClick: resetEverything, style: { backgroundColor: COLORS.red, ...fontStyle }, className: "flex-1 rounded-lg text-white text-sm font-bold py-2" }, "Yes, Delete Everything"),
                         React.createElement("button", { onClick: () => setConfirmReset(false), style: { borderColor: COLORS.ink, color: COLORS.ink, ...fontStyle }, className: "flex-1 rounded-lg border-2 text-sm font-bold py-2" }, "Cancel"))))),
-            React.createElement("button", { onClick: handleGoogleSignOut, disabled: !googleSignedIn, style: { borderColor: COLORS.red, color: COLORS.red, ...fontStyle }, className: "w-full rounded-xl border-2 py-3 font-bold flex items-center justify-center gap-2 text-sm disabled:opacity-40 transition-transform active:scale-[0.98]" },
+            !confirmSignOut ? (React.createElement("button", { onClick: () => setConfirmSignOut(true), disabled: !googleSignedIn, style: { borderColor: COLORS.red, color: COLORS.red, ...fontStyle }, className: "w-full rounded-xl border-2 py-3 font-bold flex items-center justify-center gap-2 text-sm disabled:opacity-40 transition-transform active:scale-[0.98]" },
                 React.createElement(LogOut, { size: 16 }),
-                " Log Out")));
+                " Log Out")) : (React.createElement("div", { className: "rounded-xl border-2 p-4 flex flex-col gap-2", style: { borderColor: COLORS.red, backgroundColor: COLORS.card } },
+                React.createElement("p", { style: { ...fontStyle, color: COLORS.ink }, className: "text-sm" }, "Sign out of Google Drive? This clears decks, cards, and notes stored on this device \u2014 they stay backed up in Drive, so signing back in restores them."),
+                React.createElement("div", { className: "flex gap-2" },
+                    React.createElement("button", { onClick: handleGoogleSignOut, disabled: signOutBusy, style: { backgroundColor: COLORS.red, ...fontStyle }, className: "flex-1 rounded-lg text-white text-sm font-bold py-2 flex items-center justify-center gap-2 disabled:opacity-60" }, signOutBusy ? React.createElement(RefreshCw, { size: 16, className: "animate-spin" }) : React.createElement(LogOut, { size: 16 }), " ", signOutBusy ? 'Logging out\u2026' : 'Yes, Log Out'),
+                    React.createElement("button", { onClick: () => setConfirmSignOut(false), disabled: signOutBusy, style: { borderColor: COLORS.ink, color: COLORS.ink, ...fontStyle }, className: "flex-1 rounded-lg border-2 text-sm font-bold py-2 disabled:opacity-40" }, "Cancel"))))));
         // =====================================================================
         // SECTION: BACKUP & RESTORE SCREEN  (search: SECTION: BACKUP SCREEN)
         // Local backup/restore buttons, Google Drive status + backup/restore/
@@ -3294,7 +3365,7 @@ export default function FlashcardDrillApp() {
         const noticeColor = driveNotice?.tone === 'error' ? COLORS.red : driveNotice?.tone === 'success' ? COLORS.green : COLORS.mustard;
         const noticeBg = driveNotice?.tone === 'error' ? COLORS.redBg : driveNotice?.tone === 'success' ? COLORS.greenBg : COLORS.mustardBg;
         content = (React.createElement("div", { className: "flex flex-col gap-4" },
-            React.createElement(BackHeader, { colors: COLORS, onBack: () => { setView('settings'); setPendingRestore(null); setSignInSyncPrompt(null); }, title: "Backup & Restore" }),
+            React.createElement(BackHeader, { colors: COLORS, onBack: () => { setView('settings'); setPendingRestore(null); setSignInSyncPrompt(null); setConfirmSignOut(false); }, title: "Backup & Restore" }),
             React.createElement("input", { ref: restoreFileInputRef, type: "file", accept: ".json,application/json", onChange: handleRestoreFileSelected, className: "hidden" }),
             driveNotice && (React.createElement("div", { className: "rounded-lg border-2 px-3 py-2 flex items-start gap-2", style: { borderColor: noticeColor, backgroundColor: noticeBg } },
                 driveNotice.tone === 'error' ? (React.createElement(AlertTriangle, { size: 16, style: { color: noticeColor }, className: "shrink-0 mt-0.5" })) : (React.createElement(Check, { size: 16, style: { color: noticeColor }, className: "shrink-0 mt-0.5" })),
@@ -3342,9 +3413,14 @@ export default function FlashcardDrillApp() {
                             React.createElement(Check, { size: 14 }),
                             " ",
                             googleEmail || 'Signed in'),
-                        React.createElement("button", { onClick: handleGoogleSignOut, style: { color: COLORS.inkFaint, ...fontStyle }, className: "text-xs flex items-center gap-1" },
+                        React.createElement("button", { onClick: () => setConfirmSignOut(true), style: { color: COLORS.inkFaint, ...fontStyle }, className: "text-xs flex items-center gap-1" },
                             React.createElement(LogOut, { size: 13 }),
                             " Sign out")),
+                    confirmSignOut && (React.createElement("div", { className: "rounded-lg border-2 p-3 flex flex-col gap-2", style: { borderColor: COLORS.red, backgroundColor: COLORS.card } },
+                        React.createElement("p", { style: { ...monoStyle, color: COLORS.ink }, className: "text-xs leading-relaxed" }, "Sign out of Google Drive? This clears decks, cards, and notes stored on this device \u2014 they stay backed up in Drive, so signing back in restores them."),
+                        React.createElement("div", { className: "flex gap-2" },
+                            React.createElement("button", { onClick: handleGoogleSignOut, disabled: signOutBusy, style: { backgroundColor: COLORS.red, ...fontStyle }, className: "flex-1 rounded-lg text-white text-xs font-bold py-2 flex items-center justify-center gap-2 disabled:opacity-60" }, signOutBusy ? React.createElement(RefreshCw, { size: 14, className: "animate-spin" }) : React.createElement(LogOut, { size: 14 }), " ", signOutBusy ? 'Logging out\u2026' : 'Yes, Log Out'),
+                            React.createElement("button", { onClick: () => setConfirmSignOut(false), disabled: signOutBusy, style: { borderColor: COLORS.ink, color: COLORS.ink, ...fontStyle }, className: "flex-1 rounded-lg border-2 text-xs font-bold py-2 disabled:opacity-40" }, "Cancel")))),
                     React.createElement("div", { className: "flex gap-2" },
                         React.createElement("button", { onClick: () => driveBackupNow(false, { full: true }), disabled: driveBusy, style: { backgroundColor: COLORS.accent, ...fontStyle }, className: "flex-1 rounded-lg text-white text-sm font-bold py-2.5 flex items-center justify-center gap-2 disabled:opacity-50" },
                             React.createElement(RefreshCw, { size: 16 }),
