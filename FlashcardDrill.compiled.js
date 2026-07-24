@@ -680,6 +680,15 @@ export default function FlashcardDrillApp() {
     // files haven't changed since last time. Mirrored to BACKUP_META_KEY via
     // persistBackupMeta so it survives a reload; loaded back into this ref on mount.
     const deckSyncMetaRef = useRef({});
+    // deletedDeckIdsRef: deck ids deliberately deleted locally (deleteDeck/
+    // deleteCategory) whose removal hasn't been confirmed gone from Drive's
+    // decks.json yet. Deletions deliberately skip auto-backup (see deleteDeck),
+    // so this is what lets a *later* decks.json write (auto or full) still know
+    // to drop that deck rather than reviving it from Drive's copy — see
+    // buildMergedDecksForUpload / FUNCTION: BACK UP TO DRIVE. Mirrored to
+    // BACKUP_META_KEY via persistBackupMeta so it survives a reload; loaded back
+    // into this ref on mount, same pattern as deckSyncMetaRef.
+    const deletedDeckIdsRef = useRef([]);
     // Edit Zone (Settings → Categories → Decks → Cards) state
     const [editZoneLevel, setEditZoneLevel] = useState('categories'); // 'categories' | 'decks' | 'cards'
     const [editZoneCategory, setEditZoneCategory] = useState(null);
@@ -821,6 +830,8 @@ export default function FlashcardDrillApp() {
                         setHasSignedInBefore(m.hasSignedInBefore);
                     if (m.deckSync && typeof m.deckSync === 'object')
                         deckSyncMetaRef.current = m.deckSync;
+                    if (Array.isArray(m.deletedDeckIds))
+                        deletedDeckIdsRef.current = m.deletedDeckIds;
                 }
             }
             catch (e) { }
@@ -883,6 +894,7 @@ export default function FlashcardDrillApp() {
             driveSignedOutByUser,
             hasSignedInBefore,
             deckSync: deckSyncMetaRef.current,
+            deletedDeckIds: deletedDeckIdsRef.current,
             ...patch,
         };
         if ('lastLocalBackupAt' in patch)
@@ -897,6 +909,8 @@ export default function FlashcardDrillApp() {
             setHasSignedInBefore(patch.hasSignedInBefore);
         if ('deckSync' in patch)
             deckSyncMetaRef.current = patch.deckSync;
+        if ('deletedDeckIds' in patch)
+            deletedDeckIdsRef.current = patch.deletedDeckIds;
         try {
             await window.storage.set(BACKUP_META_KEY, JSON.stringify(next), false);
         }
@@ -1435,6 +1449,50 @@ export default function FlashcardDrillApp() {
     // handleGoogleSignIn), since driveAccessToken state hasn't re-rendered yet at that
     // point and would otherwise still read as the PRE-sign-in (often null) value —
     // see "Fixed 2026-07-24" in CONTEXT.md.
+    // buildMergedDecksForUpload: decks.json is the one Drive file that's a single
+    // shared manifest rather than sharded per deck, so writing it from local state
+    // alone races across concurrent sessions — e.g. two browsers signed into the
+    // same account each creating a different new deck around the same time. Each
+    // browser only knows about its own new deck; a blind overwrite from either
+    // side wipes the other's deck out of the manifest even though nothing was ever
+    // deleted (confirmed by testing 2026-07-24 — see CONTEXT.md). Before every
+    // decks.json write, fetch Drive's current copy and take the union with local:
+    // local's version of a shared deck id wins (this session's create/rename/
+    // practiceOrder change is the freshest thing known about it); any deck id
+    // Drive has that this session doesn't is preserved rather than dropped —
+    // unless it's in deletedDeckIdsRef, meaning THIS session explicitly deleted it
+    // (deleteDeck/deleteCategory deliberately skip auto-backup, so this merge step
+    // is what actually lands that removal on Drive). Tombstones no longer present
+    // in Drive's copy are pruned so the list doesn't grow forever. Network failure
+    // while fetching Drive's copy falls back to local-only so the write still goes
+    // through — the next successful write re-merges and heals any gap.
+    async function buildMergedDecksForUpload(token, localDecks) {
+        let driveDecks = [];
+        try {
+            const existingId = await driveFindFileIdByName(token, DRIVE_DECKS_FILENAME);
+            if (existingId) {
+                const fetched = await driveFetchJson(token, existingId);
+                if (Array.isArray(fetched))
+                    driveDecks = fetched;
+            }
+        }
+        catch (e) {
+            return localDecks;
+        }
+        const tombstones = new Set(deletedDeckIdsRef.current || []);
+        const localIds = new Set(localDecks.map((d) => d.id));
+        const merged = [...localDecks];
+        driveDecks.forEach((dd) => {
+            if (!localIds.has(dd.id) && !tombstones.has(dd.id))
+                merged.push(dd);
+        });
+        const stillPresentOnDrive = new Set(driveDecks.map((d) => d.id));
+        const nextTombstones = (deletedDeckIdsRef.current || []).filter((id) => stillPresentOnDrive.has(id));
+        if (nextTombstones.length !== (deletedDeckIdsRef.current || []).length) {
+            persistBackupMeta({ deletedDeckIds: nextTombstones });
+        }
+        return merged;
+    }
     async function driveBackupNow(silent, scope, overrideDecks, overrideCards, overrideNotes, overrideSettings, overrideToken) {
         if (!silent)
             setDriveNotice(null);
@@ -1446,7 +1504,8 @@ export default function FlashcardDrillApp() {
         const attemptUpload = async (token) => {
             const jobs = [];
             if (scope.full || scope.decks) {
-                jobs.push(driveUploadNamedFile(token, DRIVE_DECKS_FILENAME, decksNow));
+                jobs.push(buildMergedDecksForUpload(token, decksNow)
+                    .then((merged) => driveUploadNamedFile(token, DRIVE_DECKS_FILENAME, merged)));
             }
             if (scope.full || scope.settings) {
                 jobs.push(driveUploadNamedFile(token, DRIVE_SETTINGS_FILENAME, { cycleSize: settingsNow }));
@@ -2353,6 +2412,7 @@ export default function FlashcardDrillApp() {
         persistDecks(nextDecks);
         persistCards(nextCards);
         persistNotes(nextNotes);
+        persistBackupMeta({ deletedDeckIds: [...new Set([...deletedDeckIdsRef.current, deckId])] });
         setEditZoneNotice(googleSignedIn ? 'Deck deleted. Back up manually to save this on Drive.' : 'Deck deleted.');
     }
     function deleteCategory(categoryKey) {
@@ -2365,6 +2425,7 @@ export default function FlashcardDrillApp() {
         persistDecks(nextDecks);
         persistCards(nextCards);
         persistNotes(nextNotes);
+        persistBackupMeta({ deletedDeckIds: [...new Set([...deletedDeckIdsRef.current, ...removedDeckIds])] });
         setEditZoneNotice(googleSignedIn ? 'Category and its decks deleted. Back up manually to save this on Drive.' : 'Category and its decks deleted.');
     }
     // renameCategory / renameDeck: unlike deletions, renames DO trigger an auto-backup — they're not destructive.
