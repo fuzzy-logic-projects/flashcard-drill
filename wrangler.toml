@@ -15,3 +15,5 @@ binding = "ASSETS"
 [[kv_namespaces]]
 binding = "FLASHDRILL_SESSIONS"
 id = "281b8513225242ed9e113911e4cdd685"
+[vars]
+GOOGLE_CLIENT_ID = "790736366293-a7dlgr671caebbam0gu5kkkot8tbmcn0.apps.googleusercontent.com"
