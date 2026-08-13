@@ -96,22 +96,11 @@ const FONT_SIZE_KEY = 'flashdrill:v2:fontSize';
 const DARK_MODE_KEY = 'flashdrill:v2:darkMode';
 const BACKUP_META_KEY = 'flashdrill:v2:backupMeta';
 const DRIVE_TOKEN_CACHE_KEY = 'flashdrill:v2:driveTokenCache';
-// SILENT_REAUTH_SKIP_AFTER_MS: if the cached Drive token has been expired longer than
-// this, skip the automatic no-popup reauth attempt on load/reconnect entirely instead
-// of firing it and letting it fail. A token merely a few minutes past expiry (tab left
-// open past the 45-min background refresh) is still worth a quick silent try. A token
-// expired by more than this is the signature of an actual browser/tab closure — and
-// prompt:'none' is confirmed (see FUNCTION: STAY SIGNED IN) to hang with no callback
-// ever firing in that case, while still visibly flashing Google's own "One moment
-// please" card first. Skipping it there just shows "Continue with Google" directly.
-const SILENT_REAUTH_SKIP_AFTER_MS = 10 * 60 * 1000;
 // ---- Google Drive backup config -------------------------------------------------
-// Replace with your own OAuth Web Client ID from Google Cloud Console before this
-// will work. It will NOT authenticate inside the Claude preview — it needs to be
-// hosted on a real domain (e.g. GitHub Pages) that's registered as an authorized
-// JavaScript origin for this client ID. See the setup notes in the Backup screen.
-const GOOGLE_CLIENT_ID = '790736366293-a7dlgr671caebbam0gu5kkkot8tbmcn0.apps.googleusercontent.com';
-const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.appdata';
+// Auth is handled entirely server-side now, by the Cloudflare Pages Functions
+// under /api/auth/* (see /functions/api/auth/*.js) — this file never holds a
+// client ID/secret and never talks to Google directly for sign-in. See
+// "Google sign-in persistence" in CONTEXT.md for why.
 // DRIVE_BACKUP_FILENAME: the OLD single-file backup name. Kept only as a
 // migration source (FUNCTION: RESTORE ON SIGN-IN reads it once, the first
 // time decks.json doesn't exist yet) and as a dormant safety net — nothing
@@ -570,42 +559,7 @@ function formatTimestamp(iso) {
     const timePart = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
     return `${datePart}, ${timePart}`;
 }
-// Lazily injects the Google Identity Services script. Resolves once window.google
-// is usable, rejects if it can't load (e.g. blocked in a sandboxed preview).
-let gsiLoadPromise = null;
 // ===== FUNCTIONS: GOOGLE SIGN-IN / DRIVE (search: FUNCTIONS: GOOGLE SIGN-IN) =====
-// loadGoogleIdentityScript: injects Google's sign-in library into the page.
-// Not usable inside a Claude preview — only works once hosted on a real domain.
-function loadGoogleIdentityScript() {
-    if (window.google && window.google.accounts && window.google.accounts.oauth2) {
-        return Promise.resolve();
-    }
-    if (gsiLoadPromise)
-        return gsiLoadPromise;
-    gsiLoadPromise = new Promise((resolve, reject) => {
-        const existing = document.querySelector('script[data-gsi="true"]');
-        if (existing) {
-            existing.addEventListener('load', () => resolve());
-            existing.addEventListener('error', () => reject(new Error('script-blocked')));
-            return;
-        }
-        const script = document.createElement('script');
-        script.src = 'https://accounts.google.com/gsi/client';
-        script.async = true;
-        script.defer = true;
-        script.dataset.gsi = 'true';
-        script.onload = () => {
-            if (window.google && window.google.accounts && window.google.accounts.oauth2)
-                resolve();
-            else
-                reject(new Error('script-loaded-but-unusable'));
-        };
-        script.onerror = () => reject(new Error('script-blocked'));
-        document.head.appendChild(script);
-        setTimeout(() => reject(new Error('timeout')), 6000);
-    });
-    return gsiLoadPromise;
-}
 export default function FlashcardDrillApp() {
     const [loaded, setLoaded] = useState(false);
     const [view, setView] = useState('home'); // home | newDeck | importChoice | importCardsChoice | importNotesChoice | import | deck | settings | practice | practiceAllModes | raceSetup
@@ -637,29 +591,26 @@ export default function FlashcardDrillApp() {
     const [googleEmail, setGoogleEmail] = useState(null);
     const [driveSignedOutByUser, setDriveSignedOutByUser] = useState(false);
     // hasSignedInBefore: true once a real explicit Google sign-in has ever
-    // succeeded on this browser. Separate from googleEmail (which is only a
-    // login_hint and can go missing on a failed userinfo fetch) so it's a
-    // reliable gate for whether attemptSilentSignIn is even worth trying —
-    // see FUNCTION: STAY SIGNED IN. Reset to false whenever manual sign-out
-    // wipes storage, which is correct: right after sign-out there's nothing
-    // to silently reuse. Added 2026-07-23, see CONTEXT.md.
+    // succeeded on this browser. Kept for informational/telemetry purposes —
+    // no longer gates whether a silent check is attempted (that used to matter
+    // to avoid flashing Google's own UI; checkServerSession never shows any
+    // Google UI at all, so there's nothing to avoid). Reset to false whenever
+    // manual sign-out wipes storage. Added 2026-07-23, see CONTEXT.md.
     const [hasSignedInBefore, setHasSignedInBefore] = useState(false);
     const [driveAccessToken, setDriveAccessToken] = useState(null);
+    // driveBackendMissing: true only if /api/auth/token comes back 404, meaning
+    // the /functions/api/auth/* Pages Functions aren't deployed on this host —
+    // surfaced as a setup notice on the Backup screen (see driveConfigured below).
+    const [driveBackendMissing, setDriveBackendMissing] = useState(false);
     const [driveBusy, setDriveBusy] = useState(false);
     const [driveNotice, setDriveNotice] = useState(null); // { tone: 'error'|'success'|'info', text }
     const [pendingRestore, setPendingRestore] = useState(null); // { source: 'file'|'drive', payload }
     const [signInSyncPrompt, setSignInSyncPrompt] = useState(null); // { drivePayload } — shown only when local decks already exist at sign-in
     const [confirmSignOut, setConfirmSignOut] = useState(false); // gates handleGoogleSignOut behind an "are you sure" step — shared by both entry points (Settings, Backup screen)
     const [signOutBusy, setSignOutBusy] = useState(false); // spans the whole sign-out operation (last backup + revoke + local wipe), not just driveBackupNow's own driveBusy window
-    const tokenClientRef = useRef(null);
-    // pendingTokenRequestRef: the in-flight Promise for whichever request — silent
-    // or explicit — currently owns the shared token client. initTokenClient()
-    // exposes exactly one mutable .callback slot, so only one requestAccessToken()
-    // can safely be outstanding at a time; the mutex lives inside requestDriveToken
-    // itself so it guards BOTH directions (an explicit tap arriving mid-silent-check,
-    // and a silent check — mount, 45-min refresh, online-reconnect — arriving while
-    // an explicit tap is already in flight). See FUNCTION: STAY SIGNED IN and
-    // CONTEXT.md, "double sign-in" fix 2026-07-23 / 2026-07-23b.
+    // pendingTokenRequestRef: the in-flight Promise for a /api/auth/token call, so
+    // a mount-time check racing the 45-min background refresh (or online-reconnect)
+    // reuses the same request instead of firing a second one.
     const pendingTokenRequestRef = useRef(null);
     const restoreFileInputRef = useRef(null);
     const silentSignInAttemptedRef = useRef(false);
@@ -987,131 +938,71 @@ export default function FlashcardDrillApp() {
         setSelectedDeckId(null);
     }
     // ---------- Google Sign-In + Drive backup ----------
-    // NOTE: this requires GOOGLE_CLIENT_ID to be set to a real OAuth client, and the
-    // app to be served from a domain registered as an authorized origin for that
-    // client. Inside the Claude artifact preview, sign-in will fail gracefully and
-    // show a message explaining why — that's expected here, not a bug.
     // ===== FUNCTIONS: GOOGLE DRIVE CONNECTION (search: FUNCTIONS: GOOGLE DRIVE CONNECTION) =====
-    // driveConfigured: true once a real GOOGLE_CLIENT_ID has been set at the
-    // top of the file (see SECTION: GOOGLE CLIENT ID near the top constants).
+    // Auth lives entirely behind the Cloudflare Pages Functions under /api/auth/*
+    // (see /functions/api/auth/*.js) using a real OAuth authorization-code flow
+    // with a server-held refresh token. The client never sees a client ID/secret
+    // and never talks to Google for sign-in — it only ever calls its own
+    // /api/auth/* endpoints. This is what makes "stay signed in" survive any
+    // length of browser closure, not just under an hour — see "Google sign-in
+    // persistence" in CONTEXT.md.
+    // driveConfigured: false only if /api/auth/token has come back 404, meaning
+    // the Functions aren't deployed on this host yet.
     function driveConfigured() {
-        return GOOGLE_CLIENT_ID && !GOOGLE_CLIENT_ID.startsWith('YOUR_');
+        return !driveBackendMissing;
     }
-    async function ensureTokenClient() {
-        await loadGoogleIdentityScript();
-        if (!tokenClientRef.current) {
-            tokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
-                client_id: GOOGLE_CLIENT_ID,
-                scope: DRIVE_SCOPE,
-                // Routes silent session checks through FedCM (browser-mediated)
-                // rather than the legacy hidden-iframe cookie check, which Chrome's
-                // third-party-cookie blocking can break silently. Kept even though
-                // it alone didn't resolve every case tested (see CONTEXT.md) — it's
-                // the more future-proof mechanism and has no downside.
-                use_fedcm_for_prompt: true,
-                callback: () => { }, // overridden per-call below
-            });
+    // fetchServerDriveToken: asks OUR backend for a fresh Google Drive access
+    // token. The backend holds the refresh token — never the browser — and mints
+    // a new ~1hr access token from it on every call, invisibly, with no Google UI
+    // involved and no dependence on any browser-held Google session. Resolves to
+    // null if there's no server session (never signed in, or signed out/expired).
+    // Throws only on a genuine network/server error.
+    async function fetchServerDriveToken() {
+        let res;
+        try {
+            res = await fetch('/api/auth/token', { credentials: 'same-origin' });
         }
-        return tokenClientRef.current;
+        catch (e) {
+            throw new Error('token-fetch-failed');
+        }
+        if (res.status === 404) {
+            // /functions/api/auth/* isn't deployed on this host yet.
+            setDriveBackendMissing(true);
+            return null;
+        }
+        if (res.status === 401) {
+            return null; // no session — never signed in, or signed out/revoked
+        }
+        if (!res.ok)
+            throw new Error('token-fetch-failed');
+        const data = await res.json();
+        if (!data || !data.access_token)
+            return null;
+        const expiresInSec = Number(data.expires_in) || 3600;
+        persistDriveTokenCache(data.access_token, Date.now() + expiresInSec * 1000);
+        return data;
     }
-    // requestDriveToken: asks Google for an access token. Pass {silent:true} for a no-popup background attempt, or nothing for the normal "Continue with Google" click.
-    // NOTE: even {silent:true} ('prompt: none') is not guaranteed invisible — Google's
-    // own token popup can still flash briefly on mobile browsers (see
-    // FUNCTION: STAY SIGNED IN below for how we avoid calling this at all on a normal
-    // reload by reusing a still-valid cached token instead).
-    function requestDriveToken(options) {
-        const opts = options || {};
-        return new Promise(async (resolve, reject) => {
-            if (!driveConfigured()) {
-                reject(new Error('not-configured'));
-                return;
-            }
-            // Whichever call — silent or explicit — reaches here first claims the
-            // shared token client below and every other call, of either kind,
-            // waits for it and reuses its result instead of touching the client
-            // itself. This has to be symmetric: the original version only made
-            // explicit calls wait on a silent one, so a silent check that started
-            // SECOND (mount racing a fast manual tap, or the 45-min refresh /
-            // online-reconnect firing mid-tap) could still fire its own
-            // requestAccessToken() and clobber the explicit call's .callback —
-            // Google then re-runs the OAuth flow, showing the account
-            // picker/consent screen a second time even though the user already
-            // completed it once. See CONTEXT.md, "double sign-in" fix 2026-07-23b.
-            if (pendingTokenRequestRef.current) {
-                try {
-                    // Race the join itself against a timeout — the *owning* call's own 8s
-                    // timeout below only bounds ITS return value; it does NOT cancel the
-                    // underlying client.requestAccessToken() call, which can be left
-                    // dangling forever if Google never invokes the callback (confirmed:
-                    // happens after a long browser closure — see FUNCTION: STAY SIGNED IN).
-                    // Without this, a joiner (e.g. sign-out's last-chance backup) would
-                    // await that same dangling promise directly and hang indefinitely
-                    // instead of falling through to its own attempt.
-                    const existingToken = await Promise.race([
-                        pendingTokenRequestRef.current,
-                        new Promise((_, rej) => setTimeout(() => rej(new Error('pending-request-timeout')), 8000)),
-                    ]);
-                    if (existingToken) {
-                        resolve(existingToken);
-                        return;
-                    }
-                    // in-flight request resolved with nothing (declined/failed) —
-                    // fall through so this call still gets its own real attempt.
-                }
-                catch (e) {
-                    // same — an errored or still-hanging in-flight request doesn't cost
-                    // this call its shot.
-                }
-            }
-            const attempt = (async () => {
-                const client = await ensureTokenClient();
-                return await new Promise((res, rej) => {
-                    client.callback = (resp) => {
-                        if (resp && resp.access_token) {
-                            const expiresInSec = Number(resp.expires_in) || 3600;
-                            persistDriveTokenCache(resp.access_token, Date.now() + expiresInSec * 1000);
-                            res(resp.access_token);
-                        }
-                        else
-                            rej(new Error((resp && resp.error) || 'no-token'));
-                    };
-                    // Gate on googleEmail (persisted proof this account already granted
-                    // consent before), not googleSignedIn (just in-memory, false after any
-                    // failed/skipped silent attempt) — otherwise every manual fallback tap
-                    // post-silent-failure forces Google's full consent screen again instead
-                    // of the lighter account-chooser-only flow it's entitled to.
-                    const overrideConfig = { prompt: opts.silent ? 'none' : googleEmail ? '' : 'consent' };
-                    if (opts.hint)
-                        overrideConfig.login_hint = opts.hint;
-                    client.requestAccessToken(overrideConfig);
-                });
-            })();
-            // Published synchronously (no await above it in this branch) so a
-            // second call arriving in the very same tick still sees it.
-            pendingTokenRequestRef.current = attempt.catch(() => null);
-            // Confirmed 2026-07-22: after a long-enough closure, Google can drop a
-            // prompt:'none' request entirely — no callback, ever, so `attempt`
-            // would otherwise hang forever and permanently wedge the mutex above,
-            // blocking a real explicit tap behind a silent check that's never
-            // coming back. Only the silent path gets timed out — an explicit call
-            // has the user actively looking at Google's own UI, so there's really
-            // something to wait for there.
-            const settled = opts.silent
-                ? Promise.race([attempt, new Promise((_, rej) => setTimeout(() => rej(new Error('silent-timeout')), 8000))])
-                : attempt;
-            settled.then((token) => {
-                pendingTokenRequestRef.current = null;
-                resolve(token);
-            }, (err) => {
-                pendingTokenRequestRef.current = null;
-                reject(err);
-            });
+    // getDriveAccessToken: every call site that used to call requestDriveToken()
+    // now calls this. There's no popup/consent path here at all any more — that
+    // only happens during the full-page redirect kicked off by handleGoogleSignIn
+    // below. Dedupes concurrent callers so a mount check racing the 45-min
+    // refresh timer doesn't fire two requests at once.
+    async function getDriveAccessToken() {
+        if (pendingTokenRequestRef.current)
+            return pendingTokenRequestRef.current;
+        const attempt = (async () => {
+            const data = await fetchServerDriveToken();
+            return data ? data.access_token : null;
+        })();
+        pendingTokenRequestRef.current = attempt.finally(() => {
+            pendingTokenRequestRef.current = null;
         });
+        return pendingTokenRequestRef.current;
     }
     // persistDriveTokenCache: local-only cache of the current Drive access token and
     // when it expires. Lets a page reload reuse a token that's still good instead of
-    // asking Google again — see tryReuseCachedDriveToken. Cleared entirely (along
-    // with everything else) on manual sign-out, see handleGoogleSignOut.
+    // asking our backend again — see tryReuseCachedDriveToken. Cleared entirely
+    // (along with everything else) on manual sign-out, see handleGoogleSignOut.
     async function persistDriveTokenCache(token, expiresAt) {
         try {
             await window.storage.set(DRIVE_TOKEN_CACHE_KEY, JSON.stringify({ token, expiresAt }), false);
@@ -1119,58 +1010,27 @@ export default function FlashcardDrillApp() {
         catch (e) { }
     }
     // handleGoogleSignIn: runs when the "Continue with Google" button (home
-    // screen) is clicked. Shows an error instead of a popup if GOOGLE_CLIENT_ID
-    // hasn't been set yet, or if this is running inside a Claude preview.
-    async function handleGoogleSignIn() {
-        setDriveNotice(null);
-        if (!driveConfigured()) {
-            setDriveNotice({
-                tone: 'error',
-                text: 'Google Sign-in isn\u2019t set up yet. Add your OAuth Client ID at the top of this file and host the app on a real domain (see setup notes below) \u2014 it can\u2019t authenticate inside this preview.',
-            });
-            return;
-        }
-        setDriveBusy(true);
-        try {
-            const token = await requestDriveToken();
-            setDriveAccessToken(token);
-            setGoogleSignedIn(true);
-            persistBackupMeta({ driveSignedOutByUser: false, hasSignedInBefore: true });
-            await captureGoogleEmailIfMissing(token);
-            await syncAfterSignIn(token);
-            setDriveNotice((prev) => prev || { tone: 'success', text: 'Signed in.' });
-        }
-        catch (e) {
-            setDriveNotice({
-                tone: 'error',
-                text: e && e.message === 'script-blocked'
-                    ? 'Google\u2019s sign-in script couldn\u2019t load here \u2014 this preview sandbox blocks it. This works once hosted on your own domain.'
-                    : 'Sign-in didn\u2019t complete. If this is hosted, check that your domain is an authorized origin in Google Cloud Console.',
-            });
-        }
-        finally {
-            setDriveBusy(false);
-        }
+    // screen) is clicked. A full top-level redirect to our backend's login
+    // endpoint, which sends the browser on to Google's consent screen and back —
+    // the page reloads on return; see the mount effect below (search "gdrive=")
+    // for what happens next.
+    function handleGoogleSignIn() {
+        window.location.href = '/api/auth/login';
     }
     // handleGoogleSignOut: a manual sign-out wipes every local trace of this app —
-    // decks/cards/notes, settings, and the sign-in info — from this browser. Google
-    // Drive itself is never touched (no delete call is made against the backup
-    // file), so the next sign-in on any device can restore from it. Runs one last
-    // silent backup first (best-effort, using the token we already have — no
-    // popup) so nothing created since the last backup is lost once local storage
-    // is cleared below.
+    // decks/cards/notes, settings, and the sign-in info — from this browser, AND
+    // tells the backend to delete the server-side session (refresh token + KV
+    // entry) so this browser can't silently recover it later. Google Drive itself
+    // is never touched (no delete call is made against the backup file), so the
+    // next sign-in on any device can restore from it. Runs one last silent backup
+    // first (best-effort, using the token we already have) so nothing created
+    // since the last backup is lost once local storage is cleared below.
     async function handleGoogleSignOut() {
         setSignOutBusy(true);
         try {
             if (driveAccessToken) {
                 try {
-                    // Best-effort only — sign-out must never hang waiting on Drive. Bounded
-                    // to 10s: driveBackupNow's own expired-token retry can still be waiting
-                    // out a stuck silent request it joined (bounded to 8s by the
-                    // requestDriveToken fix above), so give it a little more than that, then
-                    // move on regardless. See "Fixed 2026-07-24" in CONTEXT.md — this is what
-                    // used to make Log Out sometimes just sit on Google's "One moment please"
-                    // and never complete.
+                    // Best-effort only — sign-out must never hang waiting on Drive.
                     await Promise.race([
                         driveBackupNow(true, { full: true }),
                         new Promise((resolve) => setTimeout(resolve, 10000)),
@@ -1178,14 +1038,15 @@ export default function FlashcardDrillApp() {
                 }
                 catch (e) { }
             }
-            if (driveAccessToken && window.google && window.google.accounts && window.google.accounts.oauth2) {
-                try {
-                    window.google.accounts.oauth2.revoke(driveAccessToken, () => { });
-                }
-                catch (e) { }
+            try {
+                // Revokes the refresh token with Google and deletes the KV session —
+                // see /functions/api/auth/logout.js. Best-effort: the local wipe
+                // below still runs even if this fails or the network is down.
+                await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
             }
+            catch (e) { }
             // Record the explicit sign-out before attempting the wipe below, so that even
-            // if the wipe only partly succeeds, attemptSilentSignIn still won't reuse the
+            // if the wipe only partly succeeds, checkServerSession still won't reuse the
             // old session on the next load.
             await persistBackupMeta({ driveSignedOutByUser: true });
             // Wipe every key this app has written to localStorage (private scope only —
@@ -1221,26 +1082,10 @@ export default function FlashcardDrillApp() {
             setSignOutBusy(false);
         }
     }
-    // tryReuseCachedDriveToken: on load, before ever asking Google for anything, check
-    // whether we already have an access token saved from earlier that hasn't expired
-    // yet (2 min safety buffer). If so, use it directly and skip Google entirely.
-    // This — not attemptSilentSignIn below — is what stops the visible Google "One
-    // moment please" screen from flashing on a normal reload: Google's silent
-    // reauth (prompt:'none') still briefly opens a real window on mobile browsers to
-    // check the session, so the only way to truly never show it is to not ask when
-    // we don't have to. Returns { reused, expiredForMs }: reused is true if it reused
-    // a token; when false, expiredForMs tells the caller how stale the dead token is
-    // (null if there was none) so it can decide whether a silent retry is even worth
-    // attempting — see SILENT_REAUTH_SKIP_AFTER_MS.
     // captureGoogleEmailIfMissing: fetches and persists the account email if we
-    // don't have it yet. Called opportunistically after EVERY successful token
-    // acquisition (explicit sign-in, silent reauth, cached-token reuse) — not
-    // just once at initial sign-in. Root cause found 2026-07-22: this used to
-    // run only inline in handleGoogleSignIn; if that one userinfo fetch ever
-    // failed (network blip, ad blocker, etc.), googleEmail stayed null forever,
-    // and attemptSilentSignIn required googleEmail to even attempt a silent
-    // reauth — so a single missed fetch permanently disabled auto sign-in for
-    // that browser. Now it just keeps retrying on every subsequent success.
+    // don't have it yet. Called opportunistically after every successful token
+    // acquisition. Works because /api/auth/login requests the (non-sensitive)
+    // openid/email scopes alongside drive.appdata — see /functions/api/auth/login.js.
     async function captureGoogleEmailIfMissing(token) {
         if (googleEmail || !token)
             return;
@@ -1256,69 +1101,47 @@ export default function FlashcardDrillApp() {
         }
         catch (e) { }
     }
+    // tryReuseCachedDriveToken: on load, before ever asking our backend for
+    // anything, check whether we already have an access token saved from earlier
+    // that hasn't expired yet (2 min safety buffer). If so, use it directly and
+    // skip a network call entirely. Returns true if it reused a token.
     async function tryReuseCachedDriveToken() {
         try {
             const res = await window.storage.get(DRIVE_TOKEN_CACHE_KEY, false);
             if (!res || !res.value)
-                return { reused: false, expiredForMs: null };
+                return false;
             const cached = JSON.parse(res.value);
-            if (cached && cached.token && cached.expiresAt) {
-                if (cached.expiresAt - 120000 > Date.now()) {
-                    setDriveAccessToken(cached.token);
-                    setGoogleSignedIn(true);
-                    captureGoogleEmailIfMissing(cached.token);
-                    return { reused: true, expiredForMs: 0 };
-                }
-                return { reused: false, expiredForMs: Date.now() - cached.expiresAt };
+            if (cached && cached.token && cached.expiresAt && cached.expiresAt - 120000 > Date.now()) {
+                setDriveAccessToken(cached.token);
+                setGoogleSignedIn(true);
+                captureGoogleEmailIfMissing(cached.token);
+                return true;
             }
         }
         catch (e) { }
-        return { reused: false, expiredForMs: null };
+        return false;
     }
-    // Quietly re-authenticates using the last-used account, with no popup, so the
-    // person doesn't have to click "Continue with Google" every time they open the
-    // app. Deliberately does NOT run the sign-in sync/merge prompt — that's a
-    // one-time setup decision, not something that should resurface on every load.
-    // Respects an explicit sign-out and fails silently (no error notice) if the
-    // browser has no active Google session to reuse.
-    // ===== FUNCTION: STAY SIGNED IN (search: FUNCTION: STAY SIGNED IN) =====
-    // attemptSilentSignIn: runs once when the app opens, only if
-    // tryReuseCachedDriveToken (above) couldn't reuse a still-valid token. Tries to
-    // reuse your last Google session with no popup. Fails silently (no error shown)
-    // if there's nothing to reuse — that's expected, not a bug. NOTE: unlike the
-    // cache-reuse path, this one does call into Google and so can still show a
-    // brief "One moment please" screen on some mobile browsers — expected to be
-    // rare now since it only runs when there's no valid cached token left.
-    async function attemptSilentSignIn() {
-        // NOTE: googleEmail is NOT required here — it's only used as an optional
-        // login_hint (see requestDriveToken), not proof a session exists. Requiring
-        // it used to mean a one-time-missed userinfo fetch permanently blocked every
-        // future silent reauth. driveSignedOutByUser is the only real gate on
-        // whether we're ALLOWED to try. hasSignedInBefore is a separate gate on
-        // whether it's worth TRYING at all: a browser that has never completed a
-        // real sign-in has no session for Google to silently find, so prompt:'none'
-        // is guaranteed to fail — but it still visibly calls into Google first,
-        // which is what was flashing the "One moment please" screen (see image 1)
-        // for every first-time visitor and every logged-out reload. Skipping the
-        // call entirely when hasSignedInBefore is false removes that flash without
-        // touching driveSignedOutByUser's job. Fix 2026-07-23, see CONTEXT.md.
-        if (!driveConfigured() || driveSignedOutByUser || !hasSignedInBefore)
+    // checkServerSession: runs once when the app opens (on a normal reload — not
+    // right after the OAuth redirect, which the mount effect below handles
+    // separately), and again on 'online' after a connectivity gap. Asks our
+    // backend for a token; no session just means "not signed in" — show
+    // "Continue with Google" and move on, no error shown. Deliberately does NOT
+    // run the sign-in sync/merge prompt — that's a one-time setup decision, only
+    // triggered right after a fresh OAuth round trip.
+    async function checkServerSession() {
+        if (driveSignedOutByUser)
             return null;
-        // requestDriveToken itself dedupes concurrent calls now (pendingTokenRequestRef
-        // covers silent AND explicit callers) — a second attemptSilentSignIn firing
-        // close behind this one (mount + online-reconnect, say) just reuses that
-        // in-flight result instead of racing it, so no separate ref is needed here.
         try {
-            const token = await requestDriveToken({ silent: true, hint: googleEmail });
+            const token = await getDriveAccessToken();
+            if (!token)
+                return null;
             setDriveAccessToken(token);
             setGoogleSignedIn(true);
-            await captureGoogleEmailIfMissing(token);
+            persistBackupMeta({ hasSignedInBefore: true });
+            captureGoogleEmailIfMissing(token);
             return token;
         }
         catch (e) {
-            // Expected whenever there's no active Google session in this browser, or
-            // whenever Google's own silent-reauth check declines without erroring —
-            // just leave the "Continue with Google" button showing.
             return null;
         }
     }
@@ -1536,14 +1359,16 @@ export default function FlashcardDrillApp() {
         try {
             let token = overrideToken || driveAccessToken;
             if (!token)
-                token = await requestDriveToken();
+                token = await getDriveAccessToken();
             try {
                 await attemptUpload(token);
             }
             catch (e) {
-                // Token may have expired mid-session (~1hr lifetime) — refresh
-                // silently once and retry before giving up.
-                token = await requestDriveToken({ silent: true, hint: googleEmail });
+                // Token may have expired mid-session (~1hr lifetime) — our backend
+                // mints a fresh one from the stored refresh token, no popup, always
+                // available regardless of how long this tab's been open. Retry once
+                // before giving up.
+                token = await getDriveAccessToken();
                 await attemptUpload(token);
             }
             setDriveAccessToken(token);
@@ -1721,13 +1546,10 @@ export default function FlashcardDrillApp() {
             persistBackupMeta({ deckSync: nextDeckSync });
             setDriveNotice({ tone: 'success', text: 'Synced with Google Drive.' });
             // Pass `token` explicitly (overrideToken) instead of letting driveBackupNow
-            // fall back to driveAccessToken state: this runs synchronously inside
-            // handleGoogleSignIn right after its setDriveAccessToken(token) call, before
-            // React has re-rendered — so that state var is still the PRE-sign-in value
-            // (null, or an old token) in this closure. Reading it made driveBackupNow
-            // think there was no token and fire a second, non-silent requestDriveToken()
-            // call, popping the account picker/consent screen again right after the user
-            // had just finished it. See "Fixed 2026-07-24" in CONTEXT.md.
+            // fall back to driveAccessToken state: this can run synchronously right
+            // after a setDriveAccessToken(token) call, before React has re-rendered —
+            // so that state var may still be the PRE-sign-in value (null, or an old
+            // token) in this closure. See "Fixed 2026-07-24" in CONTEXT.md.
             driveBackupNow(true, { full: true }, merged.decks, merged.cards, merged.notes, undefined, token);
             cleanupOrphanedDeckFiles(token, filesByName, merged.decks);
         }
@@ -1778,7 +1600,7 @@ export default function FlashcardDrillApp() {
         try {
             let token = driveAccessToken;
             if (!token)
-                token = await requestDriveToken();
+                token = await getDriveAccessToken();
             const filesByName = await driveListAppFiles(token);
             const decksFile = filesByName.get(DRIVE_DECKS_FILENAME);
             let payload;
@@ -1854,38 +1676,65 @@ export default function FlashcardDrillApp() {
         window.history.pushState({ view }, '');
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [view]);
-    // Runs once per app load: first try a still-valid cached token (silent, no
-    // network call to Google at all — see tryReuseCachedDriveToken). Only if that
-    // isn't available does it fall back to attemptSilentSignIn's no-popup
-    // reauthentication. Falls back further to the normal sign-in button if neither
-    // works (no active browser session, or the user explicitly signed out before).
+    // Runs once per app load. Two cases:
+    // 1. We just landed back here from the /api/auth/login → Google consent →
+    //    /api/auth/callback round trip (see /functions/api/auth/*.js), marked by
+    //    a "?gdrive=connected" (or "=error") query param on the redirect back.
+    //    That's a genuine fresh sign-in, so run the full sync/merge flow, same as
+    //    the old explicit-click path.
+    // 2. A normal reload: first try a still-valid cached token (no network call
+    //    at all — see tryReuseCachedDriveToken); otherwise ask our backend via
+    //    checkServerSession — invisible, no Google UI involved, and unlike the
+    //    old GIS-based silent reauth this works after ANY length of closure,
+    //    since it's backed by a real server-side refresh token rather than a
+    //    browser-held Google session.
     useEffect(() => {
         if (!loaded || silentSignInAttemptedRef.current)
             return;
         silentSignInAttemptedRef.current = true;
         (async () => {
-            const { reused, expiredForMs } = await tryReuseCachedDriveToken();
-            // See SILENT_REAUTH_SKIP_AFTER_MS: a token expired long enough to look like
-            // an actual browser/tab closure is confirmed to make attemptSilentSignIn's
-            // prompt:'none' call hang with no callback ever firing, while still visibly
-            // flashing Google's own "One moment please" card first — so skip it and go
-            // straight to showing "Continue with Google". A token only briefly stale is
-            // still worth the quick silent try.
-            if (!reused && (expiredForMs === null || expiredForMs <= SILENT_REAUTH_SKIP_AFTER_MS))
-                attemptSilentSignIn();
+            const params = new URLSearchParams(window.location.search);
+            const gdrive = params.get('gdrive');
+            if (gdrive) {
+                params.delete('gdrive');
+                const qs = params.toString();
+                window.history.replaceState({}, '', window.location.pathname + (qs ? `?${qs}` : '') + window.location.hash);
+            }
+            if (gdrive === 'error') {
+                setDriveNotice({ tone: 'error', text: 'Sign-in didn\u2019t complete. Please try \u201cContinue with Google\u201d again.' });
+                return;
+            }
+            if (gdrive === 'connected') {
+                const token = await fetchServerDriveToken();
+                if (token && token.access_token) {
+                    setDriveAccessToken(token.access_token);
+                    setGoogleSignedIn(true);
+                    persistBackupMeta({ driveSignedOutByUser: false, hasSignedInBefore: true });
+                    await captureGoogleEmailIfMissing(token.access_token);
+                    await syncAfterSignIn(token.access_token);
+                    setDriveNotice((prev) => prev || { tone: 'success', text: 'Signed in.' });
+                }
+                else {
+                    setDriveNotice({ tone: 'error', text: 'Sign-in didn\u2019t complete. Please try again.' });
+                }
+                return;
+            }
+            const reused = await tryReuseCachedDriveToken();
+            if (!reused)
+                checkServerSession();
         })();
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [loaded]);
-    // Google's Drive access token expires after ~1hr. If the tab is left open
-    // longer than that, nothing else renews it — so proactively re-run the
-    // same silent, no-popup sign-in every 45 minutes while signed in, well
-    // before the token actually expires.
+    // Google's Drive access token expires after ~1hr regardless of how it was
+    // obtained. If the tab is left open longer than that, nothing else renews
+    // it — so proactively re-check with our backend every 45 minutes while
+    // signed in, well before the token actually expires.
     // ===== FUNCTION: BACKGROUND TOKEN REFRESH (search: FUNCTION: BACKGROUND TOKEN REFRESH) =====
     useEffect(() => {
         if (!googleSignedIn)
             return;
         const id = setInterval(() => {
-            attemptSilentSignIn();
+            checkServerSession();
         }, 45 * 60 * 1000);
         return () => clearInterval(id);
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1896,14 +1745,14 @@ export default function FlashcardDrillApp() {
     // was wasted too. Without this, recovery waits for the next interval tick (up to
     // 45 more min) or a manual reload. 'online' fires as soon as the OS reports
     // connectivity back, so retry immediately: reuse the cache if it's still valid,
-    // otherwise fall back to the same no-popup silent reauth.
+    // otherwise ask our backend.
     // ===== FUNCTION: ONLINE RECONNECT SIGN-IN (search: FUNCTION: ONLINE RECONNECT SIGN-IN) =====
     useEffect(() => {
         function onOnline() {
             (async () => {
-                const { reused, expiredForMs } = await tryReuseCachedDriveToken();
-                if (!reused && (expiredForMs === null || expiredForMs <= SILENT_REAUTH_SKIP_AFTER_MS))
-                    attemptSilentSignIn();
+                const reused = await tryReuseCachedDriveToken();
+                if (!reused)
+                    checkServerSession();
             })();
         }
         window.addEventListener('online', onOnline);
@@ -3495,7 +3344,7 @@ export default function FlashcardDrillApp() {
                         formatTimestamp(lastDriveBackupAt)))),
                 React.createElement("p", { style: { ...monoStyle, color: COLORS.inkFaint }, className: "text-xs mt-4" }, "Backs up automatically whenever something changes \u2014 new decks, imports, edits, deletions, and practice checkpoints \u2014 no schedule to configure."),
                 !driveConfigured() && (React.createElement("div", { className: "mt-4 rounded-lg border border-dashed px-3 py-2", style: { borderColor: COLORS.mustard, backgroundColor: COLORS.mustardBg } },
-                    React.createElement("p", { style: { ...monoStyle, color: COLORS.mustardText }, className: "text-xs leading-relaxed" }, "Setup needed: this button won't authenticate until you (1) create an OAuth Client ID in Google Cloud Console, (2) paste it into GOOGLE_CLIENT_ID at the top of this file, and (3) host the app on a real domain registered as an authorized origin. It will not work inside this preview."))))));
+                    React.createElement("p", { style: { ...monoStyle, color: COLORS.mustardText }, className: "text-xs leading-relaxed" }, "Setup needed: this app's /api/auth backend isn't reachable here. Deploy the /functions folder alongside this site on Cloudflare Pages and set GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET and the KV binding \u2014 see DEPLOY.md."))))));
         // =====================================================================
         // SECTION: EDIT ZONE — CATEGORIES  (search: SECTION: EDIT ZONE CATEGORIES)
         // Top level of Settings > Edit Zone. Search bar, category list, each

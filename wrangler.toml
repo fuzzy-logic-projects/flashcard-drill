@@ -1,0 +1,13 @@
+# Used for local testing (`wrangler pages dev`) and as a reference for the
+# KV binding this project needs. If you deploy via the Cloudflare dashboard
+# (git-connected or drag-and-drop), you configure the same binding there
+# instead — see DEPLOY.md. Either way is fine; they don't conflict as long as
+# the binding name (FLASHDRILL_SESSIONS) matches.
+
+name = "flashcard-drill"
+compatibility_date = "2026-08-01"
+pages_build_output_dir = "."
+
+[[kv_namespaces]]
+binding = "FLASHDRILL_SESSIONS"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
