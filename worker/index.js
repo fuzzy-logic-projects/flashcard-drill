@@ -1,3 +1,4 @@
+// redeploy trigger
 // worker/index.js — single Worker entry point.
 //
 // Cloudflare's current git-integration ("Workers Builds") deploys this
