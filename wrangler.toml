@@ -16,5 +16,5 @@ binding = "ASSETS"
 # below with the real one shown on the namespace's page (or via
 # `wrangler kv namespace list`). Deploys fail without a real id here.
 [[kv_namespaces]]
-binding = "flashcard-drill"
+binding = "FLASHDRILL_SESSIONS"
 id = "281b8513225242ed9e113911e4cdd685"
