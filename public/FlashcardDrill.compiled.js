@@ -392,26 +392,62 @@ function classifyDifficulty(card, elapsedSeconds, deck) {
         return 'good';
     return 'weak';
 }
-// scheduleNextLevel: moves a card's level based on this session's outcome —
-// called only after a REAL practice session (Review Due only — Practice All
-// MCQ and Practice by Difficulty are both read-only and never call this).
-// outcome is one of:
-//   'incorrect' -> back to level 1, no matter what level it was (a miss
-//                  always fully resets, regardless of how fast the retry was)
-//   'weak'      -> level down by 1 (floor at level 1)
-//   'good'      -> level unchanged
-//   'strong'    -> level up by 1
-// To change what each outcome does to the level, edit the branches below.
-// To change the day intervals themselves, edit LEVEL_DAYS above instead.
+// ===================================================================
+// scheduleNextLevel — decides a card's new level after an answer.
+// ===================================================================
+// Called only by Review Due (the one mode that changes progress). Practice
+// All MCQ, Practice by Difficulty and Flashcards Race are read-only and
+// never call this.
+//
+// The rules depend on how many days the card's CURRENT level is worth
+// (daysForLevel(current), checked BEFORE the answer is applied). Levels
+// map to days through LEVEL_DAYS, e.g. level 6 = 30 days, level 7 = 60.
+//
+//   Outcome     | Current level under 60 days   | Current level 60+ days
+//   ------------+-------------------------------+-----------------------
+//   'incorrect' | level - 1 (never below 1)     | unchanged
+//   'weak'      | unchanged                     | +1
+//   'good'      | +1                            | +1
+//   'strong'    | +2 (see exception below)      | +1
+//
+// Exception for 'strong': the +2 is only given if the NEW level is still
+// under 60 days. Otherwise it is +1. Example: level 5 (15d) would jump to
+// level 7 (60d), so it gets +1 and lands on level 6 instead.
+//
+// Why two rule sets: while a card is still young (under 60 days), a miss
+// is punished and a weak answer is not rewarded. Once a card is mature
+// (60+ days), a miss no longer drops its level, and any correct answer,
+// even a slow one, moves it forward.
+//
+// Returns { level, due }, where due = today + days for the new level.
+//
+// To change the 60-day cutoff, edit HIGH_LEVEL_DAYS below.
+// To change how many days each level is worth, edit LEVEL_DAYS (above).
+// Notes use a separate, simpler function: scheduleNoteLevel.
+const HIGH_LEVEL_DAYS = 60;
 function scheduleNextLevel(sr, outcome) {
-    let level = sr && typeof sr.level === 'number' ? sr.level : 1;
-    if (outcome === 'incorrect')
-        level = 1;
-    else if (outcome === 'weak')
-        level = Math.max(1, level - 1);
-    else if (outcome === 'strong')
-        level = level + 1;
-    // 'good' leaves level unchanged
+    // Current level; a card with no saved level counts as level 1.
+    const current = sr && typeof sr.level === 'number' ? sr.level : 1;
+    let level = current;
+
+    if (daysForLevel(current) >= HIGH_LEVEL_DAYS) {
+        // MATURE CARD (current level is 60+ days)
+        // Any correct answer moves it up by 1, whatever its speed.
+        if (outcome === 'weak' || outcome === 'good' || outcome === 'strong')
+            level = current + 1;
+        // 'incorrect' falls through: level stays unchanged.
+    }
+    else {
+        // YOUNG CARD (current level is under 60 days)
+        if (outcome === 'incorrect')
+            level = Math.max(1, current - 1); // down 1, floor at level 1
+        else if (outcome === 'good')
+            level = current + 1;
+        else if (outcome === 'strong')
+            // +2 only if it still lands under 60 days, else +1.
+            level = daysForLevel(current + 2) < HIGH_LEVEL_DAYS ? current + 2 : current + 1;
+        // 'weak' falls through: level stays unchanged.
+    }
     return { level, due: addDaysStr(daysForLevel(level)) };
 }
 // ===== FUNCTION: NOTES SPACED REPETITION (search: FUNCTION: NOTES SPACED REPETITION) =====
